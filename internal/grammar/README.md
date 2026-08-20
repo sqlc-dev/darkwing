@@ -7,7 +7,13 @@ edit them by hand — changes happen only by advancing the pin (see PLAN.md,
 
 - Upstream: https://github.com/duckdb/duckdb
 - Source tree: `src/parser/peg/grammar/`
-- Pinned commit: `044a04a7cd39e6e8235f756597ae42dde084e5e5` (main, 2026-08-20)
+- Pinned commit: `8cbdaba6acb50db7780d22a65dd131584d472262` (main, 2026-08-18)
+- Matching oracle binary: DuckDB CLI `v2.0.0-alpha38195 (Cyanoptera) 8cbdaba6ac`
+  (the nightly build served by https://artifacts.duckdb.org; see
+  `internal/duckdbsrc`)
+
+The pin follows the oracle binary: grammar, corpus expectations, and the
+CLI used to derive them must come from the same commit.
 
 DuckDB is MIT-licensed; see `LICENSE.DUCKDB` at the repository root.
 
@@ -31,10 +37,10 @@ d145c7659cbda441cd380b7cbdda88adf84307c18148aeed46dbefbc41c72ec5  statements/cre
 2b68d04246879ca3b8162d942484e59731d367882ee18d3461dcea918589e3ad  statements/create_table.gram
 15ec6922853cdae4e1d51e7c10c1a25da70f5f2969b8b2993185c37fd81c6fe7  statements/create_trigger.gram
 0da80da21a0660a2c59b4a1312a70bb3fdf51cbfb3211925fee894db89233f21  statements/create_type.gram
-9ede97c886fa89f1c617914f88e3657192d34ae72bcf4803dee01e57cc2300c4  statements/create_view.gram
+c21f5da90d789335c80a8aee162fc834157c3dda69b3d9e95c58d821299cb853  statements/create_view.gram
 d62c7218252ad6f762cc05125dc6cfe02c3c5f906df1e3a599a958296f78ff69  statements/deallocate.gram
 f9ded93197d1133107d3ec6d48210c1c5ccdb588cc61d03d164cadebfb06881d  statements/delete.gram
-c1242ea8a05cf628e152e189df9c94d866494e1b092553fcbb45142d0b3b92e7  statements/describe.gram
+d7376c4de5b04bd8a5ac2b5453af3514c1a168e0db3a30abad61be34a3adde99  statements/describe.gram
 ec5f4bd0ba34ecfefbf09f2d637bfaec2f7b84311a639aeee589b997d72abba9  statements/detach.gram
 ca141624e02e3f1542e4b1251359b8938cd4d02c563f32bbbc5fff1fbc178643  statements/drop.gram
 9f2ad89280ac00af9f6ab462a693f21a54383738ddcbb8d144409481ef85923b  statements/execute.gram
@@ -48,7 +54,7 @@ f150e2176c4a7398f8380c5ca8be43ec1d9ad63018f1e974ebf3b6e525529ae4  statements/ext
 f01099ef498cd6dd3e32f008e8600fc2e3da9715d1f8b84d0b46d559ee7f72da  statements/pivot.gram
 68ba82f61baed8fd57bb29043d025b2aaff86da0bfde49bee711f67e1f0ff8c3  statements/pragma.gram
 a8ce0da5078fa6d07c3376ff0f3b9db21a214f53cba43f7f39c0112f9dee228c  statements/prepare.gram
-27f075e3a594815f016e851f04922d5b65ba59d818663307e147779b262fd6e5  statements/select.gram
+3b3ffd33489e8b25c74b0f547fff72c8fcf1b8ecf73b7f40d3df3b3baddff352  statements/select.gram
 1d500aeb6bdd88fc8e434bb116dde8192c13c9e7354017e596dc2ef46424288a  statements/set.gram
 2de0cc72aeb00b6b6247348bd06db8e9a088cecb2c20516e678fe4261c909877  statements/transaction.gram
 d13cc52137a903fa42b4e476341b2f08cbe24ed4ad31b41df76001151f1b58d7  statements/update.gram
@@ -58,5 +64,5 @@ d13cc52137a903fa42b4e476341b2f08cbe24ed4ad31b41df76001151f1b58d7  statements/upd
 6e0d26e4f6a6b47b4392542ed4c4a3f68db3792781d349874bd0cce537dfe877  keywords/func_name_keyword.list
 0e66c73b69c650f44d542840de6936fd6adc72bd6d8f80703209bc93aa7f4c41  keywords/reserved_keyword.list
 f999e346c982a548c8ede53d8a9022e4c366a1c54fb6380b7d97afedcf5ccad3  keywords/type_name_keyword.list
-d95aa28d78cbe3cd9dd2e0b9c77a0f32988d78e29cd8b4feedfe4044b451b609  keywords/unreserved_keyword.list
+4af9cce1fa0031eee19170211dde58af9bd782bb9cc6a2b4569957875a30da7e  keywords/unreserved_keyword.list
 ```

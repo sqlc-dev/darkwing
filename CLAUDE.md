@@ -18,6 +18,19 @@ in `internal/grammar/README.md`.
   `parser_packrat.cpp` and `matcher/*.hpp`.
 - `cmd/debug-parse/` — dump tokens or the raw `ParseResult` tree for SQL
   passed on the command line.
+- `internal/sqltest/` — sqllogictest `.test` reader (statement extraction
+  only; template substitutions are skipped, never expanded).
+- `internal/testfile/` — corpus storage format (cases separated by `==`,
+  SQL/expectation separated by `--`) plus `*.metadata.json` todo/skip
+  sidecars keyed by case content hash.
+- `internal/duckdbsrc/` — the pinned DuckDB CLI (oracle): locate, verify
+  version against the pin, run statements against `:memory:` and classify
+  Parser Error vs post-parse.
+- `cmd/regenerate/` — rebuild `parser/testdata/` from a DuckDB source tree
+  + the pinned binary. The only way corpus expectations change.
+- `cmd/next-test/` — print the next todo case from the corpus metadata.
+- `parser/` — corpus conformance harness (`parser_test.go`); the public
+  Parse API and AST arrive in milestone 3.
 
 ## Rules of the port
 
@@ -45,5 +58,29 @@ go run ./cmd/debug-parse 'SELECT 1'            # ParseResult tree
 go run ./cmd/debug-parse -tokens 'SELECT 1'    # token dump
 ```
 
-Corpus tooling (`cmd/next-test`, `cmd/regenerate`, `-check-parse`) arrives in
-milestone 2; until then upstream-transcribed unit tests are the safety net.
+## Conformance loop
+
+The milestone-2 gate: darkwing accepts a statement iff the pinned DuckDB
+binary parses it, over the whole corpus (`go test ./parser`).
+
+```
+go run ./cmd/next-test                                  # pick the next todo case
+go test ./parser -run TestCorpus -check-parse 'FRAGMENT' # dump detail for it
+# ...fix the engine...
+go test ./parser                                        # gate
+```
+
+Some oracle rejects come from upstream's *transformer* (Parser Errors whose
+message is not "syntax error at or near ..."): the matcher alone cannot
+reject those, so they stay in todo metadata until the matching transformer
+lands (milestones 3-5). Todo entries carry a note saying why.
+
+Regenerating the corpus (needs a DuckDB checkout at the pinned commit and
+the matching nightly CLI; see `internal/grammar/README.md` for the pin):
+
+```
+DARKWING_DUCKDB=/path/to/duckdb-cli \
+  go run ./cmd/regenerate -duckdb-src /path/to/duckdb
+```
+
+Never commit binaries (the CLI, *.db files) — only source and corpus text.

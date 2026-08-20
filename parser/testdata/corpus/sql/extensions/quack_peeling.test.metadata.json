@@ -1,0 +1,9 @@
+{
+  "skip": {
+    "20921c3fc370a089": "multi-statement record loading a parser extension; the CLI aborts at the failed LOAD before parsing the extension syntax, darkwing parses the whole record",
+    "346a063d5eead477": "multi-statement record loading a parser extension; the CLI aborts at the failed LOAD before parsing the extension syntax, darkwing parses the whole record",
+    "a5be0997f9c9da57": "multi-statement record loading a parser extension; the CLI aborts at the failed LOAD before parsing the extension syntax, darkwing parses the whole record",
+    "e456e604971185ae": "multi-statement record loading a parser extension; the CLI aborts at the failed LOAD before parsing the extension syntax, darkwing parses the whole record",
+    "f6ce9ff6a0e3657a": "multi-statement record loading a parser extension; the CLI aborts at the failed LOAD before parsing the extension syntax, darkwing parses the whole record"
+  }
+}

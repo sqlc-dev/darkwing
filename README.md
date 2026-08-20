@@ -20,6 +20,12 @@ loader, and matcher (with packrat memoization) — to Go.
 
 ## Status
 
+Milestone 2 (corpus + accept/reject conformance) is in place: the corpus
+under `parser/testdata/` is extracted from DuckDB's own test suite and
+classified by the pinned DuckDB CLI (`cmd/regenerate`); `go test ./parser`
+enforces *darkwing accepts iff pinned DuckDB parses*, with remaining
+disagreements tracked in todo metadata (`cmd/next-test`).
+
 Milestone 1 (engine) is complete:
 
 - `token/` — token kinds and DuckDB's keyword categories
@@ -31,8 +37,7 @@ Milestone 1 (engine) is complete:
 - `cmd/debug-parse` — dump tokens or the raw parse tree for SQL on the
   command line
 
-Next: corpus extraction and the accept/reject conformance gate against a
-pinned DuckDB binary (milestone 2), then the AST and transformers.
+Next: the typed AST and transformer core (milestone 3).
 
 ```
 $ go run ./cmd/debug-parse 'SELECT 1'

@@ -75,9 +75,8 @@ UnpivotTargetList <- Parens(TargetList)
 
 Lateral <- 'LATERAL'
 
-BaseTableName <- QualifiedTableName / UnqualifiedBaseTableName
+BaseTableName <- CatalogReservedSchemaTable / SchemaReservedTable / UnqualifiedBaseTableName
 UnqualifiedBaseTableName <- TableName
-QualifiedTableName <- CatalogReservedSchemaTable / SchemaReservedTable
 SchemaReservedTable <- SchemaQualification ReservedTableName
 CatalogReservedSchemaTable <- CatalogQualification ReservedSchemaQualification ReservedTableName
 

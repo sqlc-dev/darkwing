@@ -1,3 +1,2 @@
-CreateViewStmt <- CreateSecure? CreateRecursive? 'VIEW' IfNotExists? QualifiedName InsertColumnList? WithList? 'AS' SelectStatementInternal
+CreateViewStmt <- CreateRecursive? 'VIEW' IfNotExists? QualifiedName InsertColumnList? WithList? 'AS' SelectStatementInternal
 CreateRecursive <- 'RECURSIVE'
-CreateSecure <- 'SECURE'

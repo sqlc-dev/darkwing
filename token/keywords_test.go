@@ -12,7 +12,7 @@ import (
 func TestKeywordListCounts(t *testing.T) {
 	counts := map[string]int{
 		"reserved_keyword.list":    75,
-		"unreserved_keyword.list":  339,
+		"unreserved_keyword.list":  338,
 		"column_name_keyword.list": 55,
 		"func_name_keyword.list":   30,
 		"type_name_keyword.list":   32,
@@ -28,8 +28,8 @@ func TestKeywordListCounts(t *testing.T) {
 		}
 		total += len(words)
 	}
-	if total != 531 {
-		t.Errorf("total keyword entries = %d, want 531", total)
+	if total != 530 {
+		t.Errorf("total keyword entries = %d, want 530", total)
 	}
 }
 
@@ -39,7 +39,7 @@ func TestCategoryCounts(t *testing.T) {
 		want     int
 	}{
 		{KeywordReserved, 75},
-		{KeywordUnreserved, 339},
+		{KeywordUnreserved, 338},
 		{KeywordColumnName, 55},
 		{KeywordFuncName, 30},
 		{KeywordTypeName, 32},

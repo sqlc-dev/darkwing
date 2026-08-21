@@ -94,21 +94,7 @@ func mustTokens(t *testing.T, sql string) []token.Token {
 // matchAll drives the statement-at-a-time loop over the whole input.
 func matchAll(t *testing.T, engine *Engine, sql string) ([]ParseResult, error) {
 	t.Helper()
-	tokens := mustTokens(t, sql)
-	var results []ParseResult
-	pos := 0
-	for pos < len(tokens) {
-		r, newPos, err := engine.MatchTopLevel(tokens, pos)
-		if err != nil {
-			return nil, err
-		}
-		if newPos == pos {
-			t.Fatalf("no progress at token %d of %q", pos, sql)
-		}
-		results = append(results, r)
-		pos = newPos
-	}
-	return results, nil
+	return engine.MatchAll(mustTokens(t, sql))
 }
 
 func TestAcceptStatements(t *testing.T) {

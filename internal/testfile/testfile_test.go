@@ -49,6 +49,19 @@ func TestCanStore(t *testing.T) {
 	if !CanStore("SELECT 1 -- comment\nFROM t") {
 		t.Error("-- with trailing text is storable")
 	}
+	// shapes Read cannot reproduce byte-for-byte
+	if CanStore("") {
+		t.Error("an empty statement must not be storable")
+	}
+	if CanStore("\nSELECT 1") {
+		t.Error("a leading empty line must not be storable (Read drops it)")
+	}
+	if CanStore("# leading comment\nSELECT 1") {
+		t.Error("a leading '#' line must not be storable (header absorption)")
+	}
+	if !CanStore("SELECT 1\n # indented hash is fine") {
+		t.Error("'#' beyond the first line/column is storable")
+	}
 }
 
 func TestMetadataRoundTrip(t *testing.T) {

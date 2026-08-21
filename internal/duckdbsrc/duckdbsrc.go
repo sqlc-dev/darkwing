@@ -7,6 +7,7 @@ package duckdbsrc
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -66,14 +67,17 @@ func Verify(path string) error {
 // Verdict is the oracle's classification of one statement.
 type Verdict struct {
 	// Reject is true when the CLI raised a Parser Error. Success and any
-	// post-parse error (Binder, Catalog, ...) are must-accept, as are
-	// timeouts and crashes (execution ran, so parsing succeeded).
+	// post-parse error (Binder, Catalog, ...) are must-accept.
 	Reject bool
 	// Error is the first "Parser Error" line for rejected statements.
 	Error string
-	// TimedOut records that execution was cut short (still must-accept).
+	// TimedOut records that the CLI was cut off before printing a
+	// verdict. No verdict was observed - the hang could even be inside
+	// the CLI's parser - so callers must treat the statement as
+	// unverified, not as must-accept.
 	TimedOut bool
-	// Crashed records a CLI crash after parsing (still must-accept).
+	// Crashed records that the CLI died before printing a verdict; like
+	// TimedOut, the statement is unverified.
 	Crashed bool
 }
 
@@ -124,10 +128,11 @@ func (o *Oracle) Run(sql string) (Verdict, error) {
 	}
 	if err != nil {
 		var exitErr *exec.ExitError
-		if isExit(err, &exitErr) {
+		if errors.As(err, &exitErr) {
 			if exitErr.ExitCode() == -1 || exitErr.ExitCode() > 1 {
-				// killed by a signal or an abnormal exit: the CLI got past
-				// parsing and died executing (fuzzer statements do this)
+				// killed by a signal or an abnormal exit with no verdict
+				// printed; possibly inside the CLI's own parser, so the
+				// caller must not guess accept or reject from this
 				return Verdict{Crashed: true}, nil
 			}
 			// plain error exit with a non-parser error on stderr:
@@ -139,16 +144,17 @@ func (o *Oracle) Run(sql string) (Verdict, error) {
 	return Verdict{}, nil
 }
 
-func isExit(err error, target **exec.ExitError) bool {
-	if e, ok := err.(*exec.ExitError); ok {
-		*target = e
-		return true
-	}
-	return false
-}
-
 // classify scans CLI stderr for the first error line. Only "Parser Error"
 // means reject; everything else is post-parse.
+//
+// One known imprecision is inherent to this interface: a bind-time nested
+// parse (query('...'), query_table, json_serialize_sql parsing its string
+// argument) also raises "Parser Error" even though the outer statement
+// parsed fine, so such statements are recorded must-reject. The grammar
+// never sees the inner SQL, so those corpus cases are excluded via skip
+// entries in the metadata sidecars - triage stays manual because a
+// syntax-error-shaped disagreement is otherwise indistinguishable from a
+// genuine engine bug.
 func classify(stderr string) (Verdict, bool) {
 	for _, line := range strings.Split(stderr, "\n") {
 		line = strings.TrimSpace(line)

@@ -58,11 +58,22 @@ type File struct {
 	Cases  []Case
 }
 
-// CanStore reports whether a statement can be represented in the corpus
-// format: the format delimits with whole lines "==" and "--", so a
-// statement containing either as an exact line cannot be stored.
+// CanStore reports whether a statement round-trips through the corpus
+// format. Unstorable shapes: the format delimits with whole lines "==" and
+// "--", so a statement containing either as an exact line cannot be
+// stored; a statement whose first line is empty (Read drops blank lines
+// between cases) or starts with '#' (a leading first case would be
+// absorbed into the file header) cannot be stored either, nor can an
+// empty statement.
 func CanStore(sql string) bool {
-	for _, line := range strings.Split(sql, "\n") {
+	if sql == "" {
+		return false
+	}
+	lines := strings.Split(sql, "\n")
+	if lines[0] == "" || strings.HasPrefix(lines[0], "#") {
+		return false
+	}
+	for _, line := range lines {
 		if line == caseSeparator || line == partSeparator {
 			return false
 		}

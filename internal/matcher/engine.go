@@ -109,6 +109,29 @@ func (e *Engine) MatchTopLevel(tokens []token.Token, pos int) (ParseResult, int,
 	return runMatch(e.topLevel, tokens, pos)
 }
 
+// MatchAll peels TopLevelStatement matches until the token stream is
+// consumed - upstream's Parser::ParseQuery loop. On error it returns the
+// results matched so far alongside the error, so callers can report
+// partial progress.
+func (e *Engine) MatchAll(tokens []token.Token) ([]ParseResult, error) {
+	var results []ParseResult
+	pos := 0
+	for pos < len(tokens) {
+		r, newPos, err := e.MatchTopLevel(tokens, pos)
+		if err != nil {
+			return results, err
+		}
+		if newPos == pos {
+			// unreachable with a well-formed TopLevelStatement rule, which
+			// always consumes at least a terminator or the EOI sentinel
+			return results, &MatchError{Msg: fmt.Sprintf("matcher made no progress at token %d", pos)}
+		}
+		results = append(results, r)
+		pos = newPos
+	}
+	return results, nil
+}
+
 func runMatch(root matcher, tokens []token.Token, pos int) (result ParseResult, newPos int, err error) {
 	s := &state{
 		tokens:  tokens,

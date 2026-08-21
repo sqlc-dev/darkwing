@@ -19,7 +19,6 @@ import (
 	"github.com/sqlc-dev/darkwing/internal/matcher"
 	"github.com/sqlc-dev/darkwing/internal/testfile"
 	"github.com/sqlc-dev/darkwing/lexer"
-	"github.com/sqlc-dev/darkwing/token"
 )
 
 var (
@@ -40,17 +39,8 @@ func classify(engine *matcher.Engine, sql string) verdict {
 	if err != nil {
 		return verdict{reject: true, detail: err.Error()}
 	}
-	pos := 0
-	for pos < len(tokens) {
-		result, newPos, err := engine.MatchTopLevel(tokens, pos)
-		if err != nil {
-			return verdict{reject: true, detail: err.Error()}
-		}
-		if newPos == pos {
-			return verdict{reject: true, detail: fmt.Sprintf("matcher made no progress at token %d", pos)}
-		}
-		_ = result
-		pos = newPos
+	if _, err := engine.MatchAll(tokens); err != nil {
+		return verdict{reject: true, detail: err.Error()}
 	}
 	return verdict{}
 }
@@ -159,15 +149,12 @@ func dumpCase(t *testing.T, engine *matcher.Engine, c *testfile.Case, got verdic
 		for _, tk := range tokens {
 			fmt.Fprintf(&sb, "  %-16s %4d..%-4d %q\n", tk.Kind, tk.Span.Start, tk.Span.End, tk.Text)
 		}
-		pos := 0
-		for pos < len(tokens) {
-			result, newPos, err := engine.MatchTopLevel(tokens, pos)
-			if err != nil || newPos == pos {
-				fmt.Fprintf(&sb, "match error at token %d: %v\n", pos, err)
-				break
-			}
+		results, err := engine.MatchAll(tokens)
+		for _, result := range results {
 			sb.WriteString(matcher.Dump(result))
-			pos = newPos
+		}
+		if err != nil {
+			fmt.Fprintf(&sb, "match error: %v\n", err)
 		}
 	}
 	t.Log(sb.String())
@@ -233,6 +220,3 @@ func TestCorpusRoundTrip(t *testing.T) {
 		}
 	}
 }
-
-// keep the token package linked in for -check-parse dumps
-var _ = token.EndOfInput

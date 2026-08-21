@@ -47,21 +47,12 @@ func run(sql string, tokensOnly bool) error {
 	if err != nil {
 		return err
 	}
-	// peel one TopLevelStatement at a time, exactly like upstream's
-	// Parser::ParseQuery loop
-	pos := 0
+	results, err := engine.MatchAll(tokens)
+	if err != nil {
+		return err
+	}
 	statement := 0
-	for pos < len(tokens) {
-		result, newPos, err := engine.MatchTopLevel(tokens, pos)
-		if err != nil {
-			return err
-		}
-		if newPos == pos {
-			// no progress; should be unreachable with a well-formed
-			// TopLevelStatement rule
-			return fmt.Errorf("matcher made no progress at token %d", pos)
-		}
-		pos = newPos
+	for _, result := range results {
 		// TopLevelStatement <- Statement? (';'+ / EndOfInput): a
 		// separator-only match yields no statement, as upstream's
 		// TransformTopLevelStatement returns nullptr for it

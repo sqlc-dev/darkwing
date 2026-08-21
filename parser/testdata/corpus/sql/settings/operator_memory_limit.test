@@ -39,19 +39,7 @@ SET operator_memory_limit='1MB'
 --
 ok
 ==
-SELECT * FROM range(10000000) ORDER BY random();
---
-ok
-==
 SELECT i % 1000000 as g, COUNT(*) FROM range(10000000) t(i) GROUP BY 1;
---
-ok
-==
-SELECT DISTINCT i FROM range(10000000) t(i);
---
-ok
-==
-SELECT i, SUM(i) OVER (PARTITION BY i % 100000 ORDER BY i) FROM range(5000000) t(i);
 --
 ok
 ==

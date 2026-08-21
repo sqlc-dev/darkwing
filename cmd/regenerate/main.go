@@ -126,7 +126,9 @@ func run(srcDir, binary, outDir string, workers int, timeout time.Duration, only
 	}
 
 	corpusDir := filepath.Join(outDir, "corpus")
-	accepted, rejected := 0, 0
+	accepted, rejected, unverified := 0, 0, 0
+	written := make(map[string]bool)
+	filesWritten := 0
 	for _, pf := range perFile {
 		out := testfile.File{
 			Header: []string{
@@ -138,6 +140,13 @@ func run(srcDir, binary, outDir string, workers int, timeout time.Duration, only
 		}
 		for _, sql := range pf.stmts {
 			v := verdicts[sql]
+			if v.TimedOut || v.Crashed {
+				// no verdict was actually observed: the CLI died or was
+				// cut off, possibly inside its own parser, so recording
+				// either accept or reject would be a guess
+				unverified++
+				continue
+			}
 			c := testfile.Case{SQL: sql, Reject: v.Reject, Error: v.Error}
 			if v.Reject {
 				rejected++
@@ -146,6 +155,9 @@ func run(srcDir, binary, outDir string, workers int, timeout time.Duration, only
 			}
 			out.Cases = append(out.Cases, c)
 		}
+		if len(out.Cases) == 0 {
+			continue
+		}
 		dest := filepath.Join(corpusDir, filepath.FromSlash(pf.rel))
 		if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 			return err
@@ -153,8 +165,23 @@ func run(srcDir, binary, outDir string, workers int, timeout time.Duration, only
 		if err := testfile.Write(dest, &out); err != nil {
 			return err
 		}
+		written[dest] = true
+		filesWritten++
 	}
-	log.Printf("corpus written: %d files, %d must-accept, %d must-reject", len(perFile), accepted, rejected)
+	log.Printf("corpus written: %d files, %d must-accept, %d must-reject, %d unverified dropped",
+		filesWritten, accepted, rejected, unverified)
+
+	if only != "" || limit > 0 {
+		// a partial run regenerates a subset: removing "stale" files or
+		// rewriting the corpus-wide README would clobber state belonging
+		// to the files that were not regenerated
+		log.Printf("partial run (-only/-limit): skipping stale-file cleanup and README update")
+		return nil
+	}
+
+	if err := removeStale(corpusDir, written); err != nil {
+		return err
+	}
 
 	readme := fmt.Sprintf(`# darkwing conformance corpus
 
@@ -165,19 +192,74 @@ hand; rerun the tool instead (see PLAN.md, § Conformance oracle and corpus).
 - Pinned commit: %s
 - Oracle: DuckDB CLI %s (nightly build of the pinned commit)
 - Files: %d, cases: %d (%d must-accept, %d must-reject)
+- Statements without an observed verdict (oracle timeout/crash): %d, dropped
 
 Classification: the oracle runs each statement against :memory: with
 extension autoloading disabled. An error starting with "Parser Error"
 means must-reject (first error line recorded); success or any post-parse
-error (Binder, Catalog, ...) means must-accept.
+error (Binder, Catalog, ...) means must-accept. Statements for which the
+CLI produced no verdict (timeout or crash - possibly inside its own
+parser) are excluded rather than guessed. Bind-time nested parses (e.g.
+query('...') parsing its string argument) still surface as Parser Errors
+and are recorded must-reject; the grammar never sees the inner SQL, so
+those cases carry skip entries in the sidecars.
 
 Sidecar files (*.metadata.json) carry todo/skip lists keyed by case
 content hash; they are maintained by hand and survive regeneration.
-`, duckdbsrc.PinnedCommit, duckdbsrc.PinnedVersion, len(perFile), accepted+rejected, accepted, rejected)
+`, duckdbsrc.PinnedCommit, duckdbsrc.PinnedVersion, filesWritten, accepted+rejected, accepted, rejected, unverified)
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return err
 	}
 	return os.WriteFile(filepath.Join(outDir, "README.md"), []byte(readme), 0o644)
+}
+
+// removeStale deletes corpus files that this (full) run did not produce -
+// leftovers from tests deleted or renamed upstream, whose expectations
+// would otherwise keep gating darkwing against an older pin - along with
+// their sidecars, and any sidecar orphaned by a vanished corpus file.
+func removeStale(corpusDir string, written map[string]bool) error {
+	var stale, orphans []string
+	err := filepath.WalkDir(corpusDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		switch {
+		case strings.HasSuffix(path, ".test"):
+			if !written[path] {
+				stale = append(stale, path)
+			}
+		case strings.HasSuffix(path, ".metadata.json"):
+			corpus := strings.TrimSuffix(path, ".metadata.json")
+			if !written[corpus] {
+				orphans = append(orphans, path)
+			}
+		}
+		return nil
+	})
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, path := range stale {
+		if err := os.Remove(path); err != nil {
+			return err
+		}
+		meta := testfile.MetadataPath(path)
+		if err := os.Remove(meta); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	for _, path := range orphans {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	if len(stale) > 0 || len(orphans) > 0 {
+		log.Printf("removed %d stale corpus files and %d orphaned sidecars", len(stale), len(orphans))
+	}
+	return nil
 }
 
 func collectFiles(srcDir, only string) ([]string, error) {

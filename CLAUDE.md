@@ -29,8 +29,18 @@ in `internal/grammar/README.md`.
 - `cmd/regenerate/` — rebuild `parser/testdata/` from a DuckDB source tree
   + the pinned binary. The only way corpus expectations change.
 - `cmd/next-test/` — print the next todo case from the corpus metadata.
-- `parser/` — corpus conformance harness (`parser_test.go`); the public
-  Parse API and AST arrive in milestone 3.
+- `ast/` — the public AST: statements, query nodes, table refs,
+  expressions, DDL infos. Ports upstream's parser/ node classes.
+- `parser/` — the public `Parse`/`ParseStatement`/`ParseExpr` API, the
+  hand-written transformer (`transform_*.go`, the port of upstream's
+  `transformer/`), the corpus conformance harness (`parser_test.go`) and
+  the serialize goldens gate (`serialize_test.go`).
+- `internal/serialize/` — renders the AST in `json_serialize_sql`-
+  compatible JSON; `serialize.Equal` is the structural comparator (its
+  doc comment lists the normalizations).
+- `cmd/serialize-diff/` — diff darkwing's serialization against a live
+  oracle binary for ad-hoc statements or the whole corpus SELECT subset;
+  writes `parser/testdata/serialize/goldens.jsonl`.
 
 ## Rules of the port
 
@@ -56,12 +66,20 @@ Debugging a parse:
 ```
 go run ./cmd/debug-parse 'SELECT 1'            # ParseResult tree
 go run ./cmd/debug-parse -tokens 'SELECT 1'    # token dump
+go run ./cmd/debug-parse -ast 'SELECT 1'       # transformed AST as JSON
 ```
 
 ## Conformance loop
 
-The milestone-2 gate: darkwing accepts a statement iff the pinned DuckDB
-binary parses it, over the whole corpus (`go test ./parser`).
+Two corpus gates run under `go test ./parser`:
+
+- **Accept/reject** (`TestCorpus`): darkwing accepts a statement iff the
+  pinned DuckDB binary parses it. Since milestone 3 the classification
+  runs the full Parse pipeline, so transformer-raised Parser Errors count
+  alongside the matcher's syntax errors.
+- **Tree shape** (`TestSerializeGoldens`): `internal/serialize` output
+  must match vendored `json_serialize_sql` goldens for a corpus sample
+  (see `parser/testdata/serialize/README.md`).
 
 ```
 go run ./cmd/next-test                                  # pick the next todo case
@@ -70,10 +88,17 @@ go test ./parser -run TestCorpus -check-parse 'FRAGMENT' # dump detail for it
 go test ./parser                                        # gate
 ```
 
-Some oracle rejects come from upstream's *transformer* (Parser Errors whose
-message is not "syntax error at or near ..."): the matcher alone cannot
-reject those, so they stay in todo metadata until the matching transformer
-lands (milestones 3-5). Todo entries carry a note saying why.
+Oracle rejects raised by upstream's *transformer* (Parser Errors whose
+message is not "syntax error at or near ...") that darkwing's transformer
+does not reproduce yet stay in todo metadata with a note saying why; the
+harness flags todo entries that start agreeing so they get removed.
+
+Sweeping tree shapes against a live oracle (milestones 3-4 exit
+criteria: zero mismatches over the corpus SELECT subset):
+
+```
+DARKWING_DUCKDB=/path/to/duckdb-cli go run ./cmd/serialize-diff -corpus
+```
 
 Regenerating the corpus (needs a DuckDB checkout at the pinned commit and
 the matching nightly CLI; see `internal/grammar/README.md` for the pin):

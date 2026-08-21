@@ -1,14 +1,15 @@
 // Command debug-parse tokenizes and matches SQL from the command line,
-// dumping either the token stream or the raw ParseResult tree — the
-// milestone-1 window into the engine, before transformers and a public
-// Parse API exist.
+// dumping the token stream, the raw ParseResult tree, or the typed AST
+// (as JSON).
 //
 // Usage:
 //
-//	debug-parse [-tokens] 'SELECT 1'
+//	debug-parse [-tokens|-ast] 'SELECT 1'
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -16,16 +17,25 @@ import (
 
 	"github.com/sqlc-dev/darkwing/internal/matcher"
 	"github.com/sqlc-dev/darkwing/lexer"
+	"github.com/sqlc-dev/darkwing/parser"
 )
 
 func main() {
 	tokensOnly := flag.Bool("tokens", false, "dump the token stream instead of the parse tree")
+	astMode := flag.Bool("ast", false, "dump the typed AST as JSON instead of the parse tree")
 	flag.Parse()
 	if flag.NArg() == 0 {
-		fmt.Fprintln(os.Stderr, "usage: debug-parse [-tokens] <sql>")
+		fmt.Fprintln(os.Stderr, "usage: debug-parse [-tokens|-ast] <sql>")
 		os.Exit(2)
 	}
 	sql := strings.Join(flag.Args(), " ")
+	if *astMode {
+		if err := runAST(sql); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if err := run(sql, *tokensOnly); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
@@ -64,6 +74,22 @@ func run(sql string, tokensOnly bool) error {
 		statement++
 		fmt.Printf("-- statement %d\n", statement)
 		fmt.Print(matcher.Dump(result))
+	}
+	return nil
+}
+
+func runAST(sql string) error {
+	stmts, err := parser.Parse(context.Background(), strings.NewReader(sql))
+	if err != nil {
+		return err
+	}
+	for i, stmt := range stmts {
+		fmt.Printf("-- statement %d (%T)\n", i+1, stmt)
+		b, err := json.MarshalIndent(stmt, "", "  ")
+		if err != nil {
+			return err
+		}
+		fmt.Println(string(b))
 	}
 	return nil
 }

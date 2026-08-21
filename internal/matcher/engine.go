@@ -35,8 +35,9 @@ func (e *MatchError) Error() string {
 // Match call gets its own packrat cache, as upstream does per top-level
 // statement.
 type Engine struct {
-	root     matcher
-	topLevel matcher
+	root       matcher
+	topLevel   matcher
+	expression matcher
 }
 
 // New compiles g starting from rootRule. Rules unreachable from rootRule
@@ -58,6 +59,10 @@ func New(g *grammar.Grammar, rootRule string) (*Engine, error) {
 	// the statement-at-a-time parse loop when present
 	if tls, ok := f.matchers["TopLevelStatement"]; ok {
 		e.topLevel = tls
+	}
+	// Expression is likewise exposed for ParseExpr
+	if expr, ok := f.matchers["Expression"]; ok {
+		e.expression = expr
 	}
 	return e, nil
 }
@@ -107,6 +112,15 @@ func (e *Engine) MatchTopLevel(tokens []token.Token, pos int) (ParseResult, int,
 		return nil, pos, fmt.Errorf("engine has no TopLevelStatement rule")
 	}
 	return runMatch(e.topLevel, tokens, pos)
+}
+
+// MatchExpression matches a single Expression from the start of the
+// token stream, the entry point of ParseExpr.
+func (e *Engine) MatchExpression(tokens []token.Token) (ParseResult, int, error) {
+	if e.expression == nil {
+		return nil, 0, fmt.Errorf("engine has no Expression rule")
+	}
+	return runMatch(e.expression, tokens, 0)
 }
 
 // MatchAll peels TopLevelStatement matches until the token stream is

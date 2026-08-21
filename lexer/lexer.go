@@ -73,6 +73,34 @@ func charIsSpace(c byte) bool {
 	return c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r'
 }
 
+// unicodeSpaceLen reports the byte length of a Unicode space character at
+// sql[i] (0 when there is none). Upstream's tokenizer skips these like
+// ASCII whitespace.
+func unicodeSpaceLen(sql string, i int) int {
+	c := sql[i]
+	if c < 0x80 {
+		return 0
+	}
+	rest := sql[i:]
+	two := []string{"\u0085", "\u00a0"}
+	for _, sp := range two {
+		if len(rest) >= len(sp) && rest[:len(sp)] == sp {
+			return len(sp)
+		}
+	}
+	three := []string{
+		"\u1680", "\u2000", "\u2001", "\u2002", "\u2003", "\u2004",
+		"\u2005", "\u2006", "\u2007", "\u2008", "\u2009", "\u200a",
+		"\u2028", "\u2029", "\u202f", "\u205f", "\u3000",
+	}
+	for _, sp := range three {
+		if len(rest) >= len(sp) && rest[:len(sp)] == sp {
+			return len(sp)
+		}
+	}
+	return 0
+}
+
 func charIsDigit(c byte) bool {
 	return c >= '0' && c <= '9'
 }
@@ -341,6 +369,11 @@ func (l *lexer) run() error {
 				lastPos = i + 1
 				break
 			}
+			if ul := unicodeSpaceLen(sql, i); ul > 0 {
+				i += ul - 1
+				lastPos = i + 1
+				break
+			}
 			if opLen, ok := specialOperator(sql, i); ok {
 				// special operator - pushed with lastPos as its offset,
 				// exactly as upstream does
@@ -444,7 +477,7 @@ func (l *lexer) run() error {
 
 		case stateKeyword:
 			// '$' is valid as a non-initial identifier character
-			if c != '$' && !charIsKeyword(c) {
+			if (c != '$' && !charIsKeyword(c)) || unicodeSpaceLen(sql, i) > 0 {
 				word := sql[lastPos:i]
 				kind := token.Identifier
 				if token.IsKeyword(word) {

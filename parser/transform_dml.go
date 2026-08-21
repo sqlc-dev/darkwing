@@ -74,6 +74,9 @@ func (tc *transformContext) transformInsert(n tnode) ast.Stmt {
 	case "SelectInsertValues":
 		stmt.Query = tc.transformSelectInternalStatement(values.sole())
 	case "DefaultValues":
+		if len(stmt.Columns) > 0 {
+			raise("You can not provide both a column list and DEFAULT VALUES, please remove one of the two")
+		}
 		stmt.DefaultValues = true
 	default:
 		shapeError(values, "unknown insert values")
@@ -155,12 +158,27 @@ func (tc *transformContext) transformUpdateSetClause(n tnode) *ast.UpdateSetInfo
 			set.Expressions = append(set.Expressions, tc.transformExpression(e.child(2)))
 		}
 	case "UpdateSetTuple":
-		// Parens(List(ColumnName)) '=' Expression: every column is
-		// assigned from the single row-valued expression
+		// Parens(List(ColumnName)) '=' Expression: a row-valued
+		// expression is unpacked onto the columns (with a count check);
+		// any other expression assigns to every column, like upstream
 		for _, c := range alt.child(0).parens().listElems() {
 			set.Columns = append(set.Columns, []string{identifierText(c)})
 		}
-		set.Expressions = append(set.Expressions, tc.transformExpression(alt.child(2)))
+		expr := tc.transformExpression(alt.child(2))
+		if fn, isFn := expr.(*ast.FunctionExpression); isFn && fn.FunctionName == "row" &&
+			fn.Schema == "" && fn.Catalog == "" {
+			if len(fn.Arguments) != len(set.Columns) {
+				raise("Could not perform assignment, expected %d values, got %d",
+					len(set.Columns), len(fn.Arguments))
+			}
+			for _, a := range fn.Arguments {
+				set.Expressions = append(set.Expressions, a.Expr)
+			}
+		} else {
+			for range set.Columns {
+				set.Expressions = append(set.Expressions, expr)
+			}
+		}
 	default:
 		shapeError(alt, "unknown update set clause")
 	}
@@ -282,8 +300,19 @@ func (tc *transformContext) transformMergeInto(n tnode) ast.Stmt {
 	default:
 		shapeError(qual, "unknown merge join qualifier")
 	}
+	unconditional := map[ast.MergeMatchKind]bool{}
 	for _, match := range n.child(6).repeat() {
-		stmt.Actions = append(stmt.Actions, tc.transformMergeMatch(match))
+		action := tc.transformMergeMatch(match)
+		// once an unconditional clause exists for a match kind, further
+		// clauses of that kind are unreachable
+		if unconditional[action.Kind] {
+			kind := mergeKindString(action.Kind)
+			raise("Unconditional %s clause was already defined - any following %s clause would be unreachable", kind, kind)
+		}
+		if action.Condition == nil {
+			unconditional[action.Kind] = true
+		}
+		stmt.Actions = append(stmt.Actions, action)
 	}
 	if ret, ok := n.child(7).opt(); ok {
 		stmt.Returning = tc.transformReturning(ret)
@@ -292,6 +321,19 @@ func (tc *transformContext) transformMergeInto(n tnode) ast.Stmt {
 }
 
 // MergeMatch <- MatchedClause / NotMatchedClause
+// mergeKindString spells a match kind the way upstream's
+// ActionConditionToString does, for the unreachable-clause error.
+func mergeKindString(kind ast.MergeMatchKind) string {
+	switch kind {
+	case ast.MergeWhenMatched:
+		return "WHEN MATCHED"
+	case ast.MergeWhenNotMatchedBySource:
+		return "WHEN NOT MATCHED BY SOURCE"
+	default:
+		return "WHEN NOT MATCHED"
+	}
+}
+
 func (tc *transformContext) transformMergeMatch(n tnode) ast.MergeIntoAction {
 	action := ast.MergeIntoAction{}
 	action.SetSpan(n.span())

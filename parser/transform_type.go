@@ -52,9 +52,17 @@ func (tc *transformContext) squareBracketArray(base *ast.TypeExpression, n tnode
 		return typeExpr(sp, "list", base)
 	}
 	bound := tc.transformExpression(expr)
-	// a constant integer bound is re-synthesized as a location-free
-	// BIGINT value
-	if c, isConst := bound.(*ast.ConstantExpression); isConst && c.Value.Kind == ast.ValueInt64 {
+	// the bound must be a constant; a constant integer is re-synthesized
+	// as a location-free BIGINT value, and negative sizes are a parser
+	// error upstream (non-integer constants fail at conversion, post-parse)
+	c, isConst := bound.(*ast.ConstantExpression)
+	if !isConst {
+		raise("Expected a constant number as array size")
+	}
+	if c.Value.Kind == ast.ValueInt64 {
+		if c.Value.Int64 < 0 {
+			raise("Array size must be greater than 0")
+		}
 		c.Value.Type = ast.LogicalType{ID: "BIGINT"}
 		c.SetSpan(invalidSpan)
 	}
@@ -100,7 +108,11 @@ func (tc *transformContext) transformTypeVariation(n tnode) *ast.TypeExpression 
 	case "GeometryType":
 		var args []ast.Expr
 		if mod, ok := alt.child(1).opt(); ok {
-			args = append(args, tc.transformExpression(mod.parens()))
+			e := tc.transformExpression(mod.parens())
+			if _, isConst := e.(*ast.ConstantExpression); !isConst {
+				raise("Expected a constant as type modifier")
+			}
+			args = append(args, e)
 		}
 		return typeExpr(sp, "GEOMETRY", args...)
 	case "UnionType":
@@ -134,21 +146,33 @@ func (tc *transformContext) transformColIdTypeList(n tnode) []ast.Expr {
 func (tc *transformContext) transformTimeType(n tnode) *ast.TypeExpression {
 	_, kind := n.child(0).sole().choice()
 	name := "TIME"
-	if kind.name() == "TimestampTypeId" {
+	if kind.name() != "TimestampTypeId" {
+		if _, hasMods := n.child(1).opt(); hasMods {
+			raise("Type TIME does not allow any modifiers")
+		}
+	} else {
 		name = "TIMESTAMP"
 		// a precision modifier picks the timestamp variant
 		if mods, ok := n.child(1).opt(); ok {
 			args := tc.transformTypeModifiers(mods)
+			if len(args) > 1 {
+				raise("TIMESTAMP only supports a single modifier")
+			}
 			if len(args) == 1 {
 				if c, isConst := args[0].(*ast.ConstantExpression); isConst && c.Value.Kind == ast.ValueInt64 {
-					switch c.Value.Int64 {
-					case 0:
+					p := c.Value.Int64
+					switch {
+					case p > 10:
+						raise("TIMESTAMP only supports until nano-second precision (9)")
+					case p < 0:
+						raise("TIMESTAMP precision should be between 0 and 10 (inclusive)")
+					case p == 0:
 						name = "TIMESTAMP_S"
-					case 3:
+					case p <= 3:
 						name = "TIMESTAMP_MS"
-					case 6:
+					case p <= 6:
 						name = "TIMESTAMP"
-					case 9:
+					default:
 						name = "TIMESTAMP_NS"
 					}
 				}
@@ -235,7 +259,13 @@ func (tc *transformContext) transformTypeModifiers(n tnode) []ast.Expr {
 	if !ok {
 		return nil
 	}
-	return tc.transformExpressionList(list)
+	mods := tc.transformExpressionList(list)
+	for _, m := range mods {
+		if _, isConst := m.(*ast.ConstantExpression); !isConst {
+			raise("Expected a constant as type modifier")
+		}
+	}
+	return mods
 }
 
 // SimpleType <- CharacterSimpleType / QualifiedSimpleType

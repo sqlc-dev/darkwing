@@ -5,10 +5,11 @@
 // cmd/next-test for picking the next todo case).
 //
 // Since milestone 3 the classification runs the full Parse pipeline, so
-// transformer-raised rejects (chained comparisons, parameter mixing, ...)
-// count alongside the engine's syntax errors. Statements the transformer
-// does not cover yet (ErrUnsupported, milestone 5) are accepts: the
-// engine parsed them.
+// transformer-raised rejects (chained comparisons, recursive CTE
+// restrictions, ...) count alongside the engine's syntax errors. Since
+// milestone 5 every statement has a transformer; remaining todo entries
+// cover oracle rejects raised outside the parse pipeline (bind-time
+// validation, nested SQL parsing).
 package parser
 
 import (
@@ -33,8 +34,9 @@ var (
 
 // verdict is darkwing's accept/reject classification of one statement,
 // mirroring the oracle's: tokenizer errors, matcher syntax errors and
-// transformer-raised parser errors are rejects; anything else — including
-// statements whose transformer is still missing — is an accept.
+// transformer-raised parser errors are rejects; anything else is an
+// accept (ErrUnsupported is kept in the accept path for compatibility,
+// though Parse no longer returns it).
 type verdict struct {
 	reject bool
 	detail string

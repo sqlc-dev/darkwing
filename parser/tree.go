@@ -37,6 +37,15 @@ func (e *internalError) Error() string {
 
 func (n tnode) valid() bool { return n.r != nil }
 
+// plural picks the singular or plural spelling for a count (error
+// message helper).
+func plural(count int, one, many string) string {
+	if count == 1 {
+		return one
+	}
+	return many
+}
+
 func (n tnode) name() string {
 	if n.r == nil {
 		return ""

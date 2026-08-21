@@ -1,5 +1,5 @@
 {
   "todo": {
-    "c2d50285cb7509bb": "transformer-raised parser error: upstream rejects in the transformer, not the grammar; expected to clear as transformers land (milestones 3-5)"
+    "c2d50285cb7509bb": "oracle's Parser Error comes from outside the parse pipeline (bind-time setting/function/constraint validation or nested SQL parsing); darkwing accepts by design - revisit with milestone 6 error-fidelity work"
   }
 }

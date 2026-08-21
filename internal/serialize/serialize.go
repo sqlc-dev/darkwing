@@ -8,6 +8,7 @@ package serialize
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 
 	"github.com/sqlc-dev/darkwing/ast"
 )
@@ -109,6 +110,57 @@ func queryNode(n ast.QueryNode) map[string]any {
 		base["right"] = queryNode(node.Right)
 		base["aliases"] = stringList(node.Aliases)
 		base["key_targets"] = exprList(node.KeyTargets)
+	case *ast.InsertQueryNode:
+		ins := node.Insert
+		base["type"] = "INSERT_QUERY_NODE"
+		if ins.Query != nil {
+			base["select_statement"] = selectStatement(ins.Query)
+		} else {
+			base["select_statement"] = nil
+		}
+		base["columns"] = stringList(ins.Columns)
+		base["table"] = ins.Table
+		base["schema"] = ins.Schema
+		base["catalog"] = ins.Catalog
+		base["returning_list"] = exprList(ins.Returning)
+		base["on_conflict_info"] = onConflictInfo(ins.OnConflict)
+		// upstream materializes the insert target as a table ref only
+		// when an ON CONFLICT clause needs it
+		if ins.OnConflict != nil {
+			ref := &ast.BaseTableRef{
+				CatalogName: ins.Catalog, SchemaName: ins.Schema, TableName: ins.Table,
+			}
+			ref.Alias = ins.TableAlias
+			ref.SetSpan(ast.Span{Start: -1, End: -1})
+			base["table_ref"] = tableRef(ref)
+		} else {
+			base["table_ref"] = nil
+		}
+		base["default_values"] = ins.DefaultValues
+		order := ins.ColumnOrder
+		if order == "" {
+			order = ast.InsertByPosition
+		}
+		base["column_order"] = string(order)
+	case *ast.UpdateQueryNode:
+		up := node.Update
+		base["type"] = "UPDATE_QUERY_NODE"
+		base["table"] = tableRef(up.Table)
+		base["from_table"] = tableRef(up.From)
+		base["returning_list"] = exprList(up.Returning)
+		base["set_info"] = updateSetInfo(up.SetInfo, up.Where)
+		base["prioritize_table_when_binding"] = false
+	case *ast.DeleteQueryNode:
+		del := node.Delete
+		base["type"] = "DELETE_QUERY_NODE"
+		base["condition"] = exprOrNil(del.Where)
+		base["table"] = tableRef(del.Table)
+		using := make([]any, 0, len(del.Using))
+		for _, u := range del.Using {
+			using = append(using, tableRef(u))
+		}
+		base["using_clauses"] = using
+		base["returning_list"] = exprList(del.Returning)
 	default:
 		panic(fmt.Sprintf("serialize: unknown query node %T", n))
 	}
@@ -166,6 +218,43 @@ func orderList(orders []ast.OrderByNode) []any {
 		})
 	}
 	return out
+}
+
+// onConflictInfo renders INSERT's ON CONFLICT payload for
+// INSERT_QUERY_NODE.
+func onConflictInfo(info *ast.OnConflictInfo) map[string]any {
+	if info == nil {
+		return nil
+	}
+	return map[string]any{
+		"action_type":     string(info.Action),
+		"indexed_columns": stringList(info.IndexedColumns),
+		"set_info":        updateSetInfo(info.SetInfo, nil),
+		"condition":       exprOrNil(info.TargetWhere),
+	}
+}
+
+// updateSetInfo renders an UpdateSetInfo; where is UPDATE's own WHERE
+// clause, which upstream stores as the set-info condition.
+func updateSetInfo(set *ast.UpdateSetInfo, where ast.Expr) map[string]any {
+	if set == nil {
+		return nil
+	}
+	cond := set.Condition
+	if cond == nil {
+		cond = where
+	}
+	// SET targets are single names: the transformer rejects qualified
+	// targets like upstream
+	cols := make([]any, 0, len(set.Columns))
+	for _, c := range set.Columns {
+		cols = append(cols, c[0])
+	}
+	return map[string]any{
+		"condition":   exprOrNil(cond),
+		"columns":     cols,
+		"expressions": exprList(set.Expressions),
+	}
 }
 
 func cteMap(m ast.CTEMap) map[string]any {
@@ -659,7 +748,18 @@ func value(v ast.Value) map[string]any {
 			out["value"] = map[string]any{"upper": v.Hugeint.Upper, "lower": v.Hugeint.Lower}
 		}
 	case ast.ValueDouble:
-		out["value"] = v.Float64
+		// upstream prints non-finite doubles as bare Infinity/-Infinity/NaN
+		// tokens (invalid JSON, replicated verbatim)
+		switch {
+		case math.IsInf(v.Float64, 1):
+			out["value"] = json.RawMessage("Infinity")
+		case math.IsInf(v.Float64, -1):
+			out["value"] = json.RawMessage("-Infinity")
+		case math.IsNaN(v.Float64):
+			out["value"] = json.RawMessage("NaN")
+		default:
+			out["value"] = v.Float64
+		}
 	case ast.ValueString:
 		if v.Type.ID == "BLOB" {
 			out["value"] = blobText(v.Str)

@@ -893,6 +893,11 @@ func cloneWithAlias(e ast.Expr, alias string) ast.Expr {
 		c := *x
 		c.Alias = alias
 		return &c
+	case *ast.StarExpression:
+		// ORDER BY ALL inside ARRAY(...) clones the star
+		c := *x
+		c.Alias = alias
+		return &c
 	}
 	return e
 }

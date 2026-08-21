@@ -5,6 +5,7 @@
 package parser
 
 import (
+	"errors"
 	"math"
 	"strconv"
 	"strings"
@@ -62,13 +63,13 @@ func (tc *transformContext) transformSingle(n tnode) ast.Expr {
 	case "SpecialFunctionExpression":
 		return tc.transformSpecialFunction(alt)
 	case "ParenthesisExpression":
-		// row constructor: (a, b, ...)
+		// row constructor: (a, b, ...); () is row()
 		sp := alt.span()
-		inner, ok := alt.sole().parens().opt()
-		if !ok {
-			raise("empty parenthesis expression is not allowed")
+		var args []ast.Expr
+		if inner, ok := alt.sole().parens().opt(); ok {
+			args = tc.transformExpressionList(inner)
 		}
-		return fnCall(sp, "row", tc.transformExpressionList(inner)...)
+		return fnCall(sp, "row", args...)
 	case "IntervalLiteral":
 		return tc.transformIntervalLiteral(alt)
 	case "TypeLiteral":
@@ -284,7 +285,7 @@ func numberConstant(sp ast.Span, text string) ast.Expr {
 	clean := strings.ReplaceAll(text, "_", "")
 	lower := strings.ToLower(clean)
 	if strings.ContainsAny(lower, "e") {
-		f, err := strconv.ParseFloat(clean, 64)
+		f, err := parseDouble(clean)
 		if err != nil {
 			raise("invalid number literal \"%s\"", text)
 		}
@@ -303,11 +304,21 @@ func numberConstant(sp ast.Span, text string) ast.Expr {
 	if h, ok := parseUint128(clean); ok {
 		return constExpr(sp, ast.Value{Type: ast.LogicalType{ID: "UHUGEINT"}, Kind: ast.ValueHugeint, Hugeint: h})
 	}
-	f, err := strconv.ParseFloat(clean, 64)
+	f, err := parseDouble(clean)
 	if err != nil {
 		raise("invalid number literal \"%s\"", text)
 	}
 	return constExpr(sp, ast.Value{Type: ast.LogicalType{ID: "DOUBLE"}, Kind: ast.ValueDouble, Float64: f})
+}
+
+// parseDouble parses a float literal the way upstream does: values whose
+// magnitude exceeds the double range become ±Inf rather than errors.
+func parseDouble(s string) (float64, error) {
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil && errors.Is(err, strconv.ErrRange) {
+		return f, nil // ParseFloat already returned ±Inf
+	}
+	return f, err
 }
 
 // decimalConstant derives DECIMAL(width, scale) from the literal's
@@ -324,7 +335,7 @@ func decimalConstant(sp ast.Span, clean string, dot int) ast.Expr {
 		width = 1
 	}
 	if width > 38 {
-		f, err := strconv.ParseFloat(clean, 64)
+		f, err := parseDouble(clean)
 		if err != nil {
 			raise("invalid number literal \"%s\"", clean)
 		}

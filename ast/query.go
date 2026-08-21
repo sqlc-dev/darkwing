@@ -35,6 +35,35 @@ type CTEMap struct {
 	Entries []CTEMapEntry `json:"map,omitempty"`
 }
 
+// InsertQueryNode wraps an INSERT statement used as a CTE body
+// (upstream's INSERT_QUERY_NODE): DML with RETURNING feeding a WITH
+// entry. The statement's own WITH clause moves onto the node's CTE map.
+type InsertQueryNode struct {
+	queryNodeBase
+	Insert *InsertStatement `json:"insert"`
+}
+
+func (n *InsertQueryNode) Children() []Node { return add(n.baseChildren(), n.Insert) }
+
+// UpdateQueryNode wraps an UPDATE statement used as a CTE body
+// (upstream's UPDATE_QUERY_NODE).
+type UpdateQueryNode struct {
+	queryNodeBase
+	Update *UpdateStatement `json:"update"`
+}
+
+func (n *UpdateQueryNode) Children() []Node { return add(n.baseChildren(), n.Update) }
+
+// DeleteQueryNode wraps a DELETE statement used as a CTE body
+// (upstream's DELETE_QUERY_NODE). TRUNCATE in a CTE lands here too,
+// mirroring upstream's truncate-as-delete representation.
+type DeleteQueryNode struct {
+	queryNodeBase
+	Delete *DeleteStatement `json:"delete"`
+}
+
+func (n *DeleteQueryNode) Children() []Node { return add(n.baseChildren(), n.Delete) }
+
 // queryNodeBase carries what every DuckDB QueryNode has: result modifiers
 // and a CTE map.
 type queryNodeBase struct {

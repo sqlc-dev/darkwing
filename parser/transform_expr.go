@@ -436,14 +436,16 @@ func comparisonFromOpText(op string) (ast.ExpressionType, bool) {
 // OtherOperatorExpression <- BitwiseExpression OtherOperatorTail*
 func (tc *transformContext) transformOtherOperator(n tnode) ast.Expr {
 	expr := tc.transformBitwise(n.child(0))
-	for _, tail := range n.child(1).repeat() {
+	tails := n.child(1).repeat()
+	for i, tail := range tails {
 		_, opAlt := tail.child(0).sole().choice()
 		rhsNode := tail.child(1)
+		outermost := i == len(tails)-1
 		switch opAlt.name() {
 		case "AnyAllParsedOperator":
 			expr = tc.transformAnyAll(expr, opAlt.sole(), rhsNode, n.span().Start)
 		case "NamedOtherOperator":
-			expr = tc.transformNamedOperator(expr, opAlt.sole(), rhsNode, n.span().Start)
+			expr = tc.transformNamedOperator(expr, opAlt.sole(), rhsNode, n.span().Start, outermost)
 		default:
 			shapeError(opAlt, "unknown other-operator")
 		}
@@ -453,18 +455,25 @@ func (tc *transformContext) transformOtherOperator(n tnode) ast.Expr {
 
 // AnyAllOperator <- AnyOp AnyOrAll
 func (tc *transformContext) transformAnyAll(input ast.Expr, n tnode, rhsNode tnode, exprStart int) ast.Expr {
-	opText := n.child(0).keyword()
-	cmp, ok := comparisonFromOpText(opText)
-	if !ok {
-		raise("Unsupported comparison \"%s\" for ANY/ALL", opText)
-	}
+	opText := keywordOfOp(n.child(0))
 	_, anyOrAll := n.child(1).sole().choice()
 	isAll := anyOrAll.name() == "SubqueryAll"
+	rhs := tc.transformBitwise(rhsNode)
+	whole := ast.Span{Start: exprStart, End: rhsNode.span().End}
+	cmp, ok := comparisonFromOpText(opText)
+	if !ok {
+		if sub, isSub := rhs.(*ast.SubqueryExpression); isSub && sub.SubqueryType == ast.SubqueryScalar {
+			raise("ANY and ALL operators require one of =,<>,>,<,>=,<= comparisons!")
+		}
+		switch opText {
+		case "~", "~*", "!~", "!~*":
+			return regexAnyAll(input, rhs, opText, isAll, whole)
+		}
+		raise("Unsupported comparison \"%s\" for ANY/ALL subquery", opText)
+	}
 	if isAll {
 		cmp = negatedComparison[cmp]
 	}
-	rhs := tc.transformBitwise(rhsNode)
-	whole := ast.Span{Start: exprStart, End: rhsNode.span().End}
 	sub := tc.anySubquery(input, rhs, cmp)
 	if isAll {
 		// x > ALL(...) becomes NOT(x <= ANY(...)); the synthesized
@@ -503,19 +512,94 @@ func (tc *transformContext) anySubquery(input, rhs ast.Expr, cmp ast.ExpressionT
 	return out
 }
 
+// regexAnyAll desugars `x ~ ANY(list)` (and the ~*/!~/!~* and ALL
+// variants) into upstream's CASE:
+//
+//	CASE WHEN list_contains(list_transform(list, LAMBDA p: regexp_matches(x, p)), true) THEN true
+//	     WHEN len(list_filter(list_transform(...), LAMBDA m: m IS NULL)) > 0 THEN NULL
+//	     ELSE false END
+//
+// ALL flips the contains probe and the THEN/ELSE booleans; negated
+// operators wrap regexp_matches in NOT; ~*/!~* pass the 'i' flag. Every
+// synthesized node is location-free except the top CASE, which spans the
+// whole expression.
+func regexAnyAll(input, list ast.Expr, opText string, isAll bool, whole ast.Span) ast.Expr {
+	caseInsensitive := opText == "~*" || opText == "!~*"
+	negated := opText == "!~" || opText == "!~*"
+
+	nameRef := func(name string) *ast.ColumnRefExpression {
+		r := &ast.ColumnRefExpression{ColumnNames: []string{name}}
+		r.SetSpan(invalidSpan)
+		return r
+	}
+	boolConst := func(b bool) *ast.ConstantExpression {
+		return constExpr(invalidSpan, ast.Value{Type: ast.LogicalType{ID: "BOOLEAN"}, Kind: ast.ValueBool, Bool: b})
+	}
+
+	// LAMBDA __regex_pattern: [NOT] regexp_matches(input, __regex_pattern[, 'i'])
+	matchArgs := []ast.Expr{input, nameRef("__regex_pattern")}
+	if caseInsensitive {
+		matchArgs = append(matchArgs, constExpr(invalidSpan, varcharValue("i")))
+	}
+	var body ast.Expr = fnCall(invalidSpan, "regexp_matches", matchArgs...)
+	if negated {
+		body = notExpr(invalidSpan, body)
+	}
+	regexLambda := &ast.LambdaExpression{LHS: nameRef("__regex_pattern"), Expr: body, SyntaxType: ast.LambdaKeyword}
+	regexLambda.SetSpan(invalidSpan)
+	transformed := fnCall(invalidSpan, "list_transform", list, regexLambda)
+
+	contains := fnCall(invalidSpan, "list_contains", transformed, boolConst(!isAll))
+
+	// LAMBDA __regex_match: __regex_match IS NULL
+	nullLambda := &ast.LambdaExpression{
+		LHS:        nameRef("__regex_match"),
+		Expr:       opExpr(invalidSpan, ast.OperatorIsNull, nameRef("__regex_match")),
+		SyntaxType: ast.LambdaKeyword,
+	}
+	nullLambda.SetSpan(invalidSpan)
+	filtered := fnCall(invalidSpan, "list_filter", transformed, nullLambda)
+	anyNull := &ast.ComparisonExpression{
+		Type:  ast.CompareGreaterThan,
+		Left:  fnCall(invalidSpan, "len", filtered),
+		Right: constExpr(invalidSpan, ast.Value{Type: ast.LogicalType{ID: "INTEGER"}, Kind: ast.ValueInt64, Int64: 0}),
+	}
+	anyNull.SetSpan(invalidSpan)
+
+	out := &ast.CaseExpression{
+		CaseChecks: []ast.CaseCheck{
+			{When: contains, Then: boolConst(!isAll)},
+			{When: anyNull, Then: constExpr(invalidSpan, ast.Value{Type: ast.LogicalType{ID: "NULL"}, IsNull: true, Kind: ast.ValueNull})},
+		},
+		ElseExpr: boolConst(isAll),
+	}
+	out.SetSpan(whole)
+	return out
+}
+
 // NamedOtherOperator <- QualifiedOperator / InetOperator / JsonOperator /
 // ListOperator / StringOperator / OperatorLiteral
-func (tc *transformContext) transformNamedOperator(input ast.Expr, n tnode, rhsNode tnode, exprStart int) ast.Expr {
+// Only the outermost fold of a chain carries a location, like the binary
+// ladder levels.
+func (tc *transformContext) transformNamedOperator(input ast.Expr, n tnode, rhsNode tnode, exprStart int, outermost bool) ast.Expr {
 	_, alt := n.choice()
 	rhs := tc.transformBitwise(rhsNode)
+	sp := invalidSpan
+	if outermost {
+		sp = ast.Span{Start: exprStart, End: rhsNode.span().End}
+	}
+	if alt.name() == "QualifiedOperator" {
+		// OPERATOR(schema.op) is always a function call — comparison
+		// spellings included — with the qualifier as its schema
+		schema, opText := qualifiedOperatorParts(alt)
+		f := opCall(sp, opText, input, rhs)
+		f.Schema = schema
+		return f
+	}
 	var opText string
 	switch alt.name() {
-	case "QualifiedOperator":
-		// OPERATOR(schema.op): the qualification is dropped by upstream
-		contents := alt.parens()
-		opText = contents.child(1).keyword()
 	case "InetOperator", "JsonOperator", "ListOperator", "StringOperator":
-		opText = alt.sole().keyword()
+		opText = keywordOfOp(alt.sole())
 	default:
 		// OperatorLiteral: a free operator token
 		op, ok := alt.r.(*matcher.OperatorResult)
@@ -524,13 +608,37 @@ func (tc *transformContext) transformNamedOperator(input ast.Expr, n tnode, rhsN
 		}
 		opText = op.Operator
 	}
-	sp := ast.Span{Start: exprStart, End: rhsNode.span().End}
 	if cmp, isCmp := comparisonFromOpText(opText); isCmp {
 		c := &ast.ComparisonExpression{Type: cmp, Left: input, Right: rhs}
 		c.SetSpan(sp)
 		return c
 	}
 	return opCall(sp, opText, input, rhs)
+}
+
+// qualifiedOperatorParts unpacks OPERATOR(Parens(ColIdDot* AnyOp)) into
+// an optional schema qualifier and the operator spelling; more than one
+// qualifier is upstream's transformer error.
+func qualifiedOperatorParts(alt tnode) (schema, op string) {
+	contents := alt.child(1).parens()
+	quals := qualifiedOperatorQualifiers(contents)
+	if len(quals) > 1 {
+		raise("Too many identifiers found, expected schema.operator or operator")
+	}
+	if len(quals) == 1 {
+		schema = quals[0]
+	}
+	return schema, keywordOfOp(contents.child(1))
+}
+
+func qualifiedOperatorQualifiers(contents tnode) []string {
+	var quals []string
+	if reps, ok := contents.child(0).opt(); ok {
+		for _, cid := range reps.repeat() {
+			quals = append(quals, identifierText(cid.child(0)))
+		}
+	}
+	return quals
 }
 
 // binaryLadder folds `X <- Y Tail*` with Tail = [op, Y] into left-assoc
@@ -650,9 +758,14 @@ func (tc *transformContext) transformPrefix(n tnode) ast.Expr {
 		case "TildePrefixOperator":
 			expr = opCall(sp, "~", expr)
 		case "QualifiedOperator":
-			contents := alt.parens()
-			opText := contents.child(1).keyword()
-			expr = opCall(sp, opText, expr)
+			// the prefix form folds qualifiers into the name itself:
+			// OPERATOR(main.-) x calls "main.-", mirroring upstream
+			contents := alt.child(1).parens()
+			name := keywordOfOp(contents.child(1))
+			if quals := qualifiedOperatorQualifiers(contents); len(quals) > 0 {
+				name = strings.Join(append(quals, name), ".")
+			}
+			expr = opCall(sp, name, expr)
 		default:
 			shapeError(alt, "unknown prefix operator")
 		}

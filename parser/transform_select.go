@@ -89,12 +89,7 @@ func (tc *transformContext) transformWithStatement(n tnode, recursive bool) (str
 	case "CTESelectBody":
 		cte.Query = tc.transformSelectInternal(body.sole().parens())
 	case "CTEDMLBody":
-		stmt := tc.transformStatement(body.sole().parens())
-		sel, ok := stmt.(*ast.SelectStatement)
-		if !ok {
-			raise("can only use SELECT statements (or DML in milestone 5) inside a CTE")
-		}
-		cte.Query = sel.Node
+		cte.Query = dmlQueryNode(tc.transformStatement(body.sole().parens()))
 	default:
 		shapeError(body, "unknown CTE body")
 	}
@@ -115,6 +110,41 @@ func (tc *transformContext) transformWithStatement(n tnode, recursive bool) (str
 		}
 	}
 	return name, cte
+}
+
+// dmlQueryNode wraps a statement parsed as a CTE body in its query-node
+// form. Upstream allows SELECT and DML (with TRUNCATE landing in its
+// delete-node form) and rejects everything else; a DML statement's own
+// WITH clause moves onto the wrapping query node.
+func dmlQueryNode(stmt ast.Stmt) ast.QueryNode {
+	stmtSpan := ast.Span{Start: stmt.Pos(), End: stmt.End()}
+	switch s := stmt.(type) {
+	case *ast.SelectStatement:
+		return s.Node
+	case *ast.InsertStatement:
+		n := &ast.InsertQueryNode{Insert: s}
+		n.CTEs, s.CTEs = s.CTEs, ast.CTEMap{}
+		n.SetSpan(stmtSpan)
+		return n
+	case *ast.UpdateStatement:
+		n := &ast.UpdateQueryNode{Update: s}
+		n.CTEs, s.CTEs = s.CTEs, ast.CTEMap{}
+		n.SetSpan(stmtSpan)
+		return n
+	case *ast.DeleteStatement:
+		n := &ast.DeleteQueryNode{Delete: s}
+		n.CTEs, s.CTEs = s.CTEs, ast.CTEMap{}
+		n.SetSpan(stmtSpan)
+		return n
+	case *ast.TruncateStatement:
+		del := &ast.DeleteStatement{Table: s.Table}
+		del.SetSpan(stmtSpan)
+		n := &ast.DeleteQueryNode{Delete: del}
+		n.SetSpan(stmtSpan)
+		return n
+	}
+	raise("A CTE body must be a SELECT, INSERT, UPDATE, DELETE, or COPY TO statement")
+	return nil
 }
 
 // ---- set operation chains ---------------------------------------------
@@ -691,7 +721,10 @@ func (tc *transformContext) transformDescribe(n tnode) ast.QueryNode {
 		}
 		target, ok := alt.child(1).opt()
 		if !ok {
-			shapeError(alt, "SHOW without a target")
+			// bare SHOW expands like SHOW ALL TABLES
+			ref.ShowType = ast.ShowTypeShowUnqualified
+			ref.TableName = "__show_tables_expanded"
+			break
 		}
 		_, t := target.sole().choice()
 		switch t.name() {

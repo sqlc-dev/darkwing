@@ -443,23 +443,18 @@ func joinTypeOf(n tnode) ast.JoinType {
 	return ast.JoinInner
 }
 
+// joinTypeFromLabel maps JOIN BY (TYPE label): upstream strips an
+// optional _JOIN suffix and matches the enum spelling (mark_join → MARK).
+// Unknown labels pass through verbatim — upstream only rejects them
+// post-parse, so they are not parser errors.
 func joinTypeFromLabel(label string) ast.JoinType {
-	switch normalizeKeyword(label) {
-	case "FULL", "OUTER":
-		return ast.JoinFull
-	case "LEFT":
-		return ast.JoinLeft
-	case "RIGHT":
-		return ast.JoinRight
-	case "SEMI":
-		return ast.JoinSemi
-	case "ANTI":
-		return ast.JoinAnti
-	case "INNER":
-		return ast.JoinInner
+	name := strings.TrimSuffix(normalizeKeyword(label), "_JOIN")
+	switch name {
+	case "LEFT", "RIGHT", "INNER", "FULL", "SEMI", "ANTI",
+		"RIGHT_SEMI", "RIGHT_ANTI", "SINGLE", "MARK":
+		return ast.JoinType(name)
 	}
-	raise("unsupported join type \"%s\" in JOIN BY", label)
-	return ast.JoinInner
+	return ast.JoinType(normalizeKeyword(label))
 }
 
 // applyJoinQualifier fills ON/USING.
@@ -719,19 +714,26 @@ func (tc *transformContext) transformBaseExprNode(n tnode) ast.Expr {
 // TableUnpivotClause <- 'UNPIVOT' IncludeOrExcludeNulls? Parens(TableUnpivotClauseBody) TableAlias?
 func (tc *transformContext) transformTableUnpivot(left ast.TableRef, n tnode) ast.TableRef {
 	ref := &ast.PivotRef{Source: left}
-	ref.SetSpan(n.span())
 	if ien, ok := n.child(1).opt(); ok {
 		_, kind := ien.sole().choice()
 		ref.IncludeNulls = kind.name() == "IncludeNulls"
 	}
 	body := n.child(2).parens()
+	// upstream's unpivot ref location covers the clause body inside the
+	// parentheses
+	ref.SetSpan(body.span())
 	// TableUnpivotClauseBody <- UnpivotHeader 'FOR' UnpivotValueList+
 	ref.UnpivotNames = tc.transformUnpivotHeader(body.child(0))
-	for _, uv := range body.child(2).repeat() {
+	valueLists := body.child(2).repeat()
+	if len(valueLists) > 1 {
+		raise("UNPIVOT requires a single pivot element")
+	}
+	for _, uv := range valueLists {
 		// UnpivotValueList <- UnpivotHeader 'IN' UnpivotTargetList
 		var col ast.PivotColumn
 		col.UnpivotNames = tc.transformUnpivotHeader(uv.child(0))
-		for _, e := range uv.child(2).sole().sole().parens().listElems() {
+		// UnpivotTargetList <- Parens(TargetList)
+		for _, e := range uv.child(2).parens().listElems() {
 			col.Entries = append(col.Entries, tc.unpivotEntry(e))
 		}
 		ref.Pivots = append(ref.Pivots, col)
@@ -814,7 +816,7 @@ func (tc *transformContext) transformPivotColumnEntry(n tnode) ast.PivotColumn {
 	case "PivotColumnSubquery":
 		// BaseExpression 'IN' Parens(SelectStatementInternal)
 		return ast.PivotColumn{
-			PivotExpressions: []ast.Expr{tc.transformBaseExprNode(alt.child(0).sole())},
+			PivotExpressions: []ast.Expr{tc.transformBaseExprNode(alt.child(0))},
 			Subquery:         tc.transformSelectInternalStatement(alt.child(2).parens()),
 		}
 	case "PivotValueList":

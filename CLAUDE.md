@@ -88,10 +88,14 @@ go test ./parser -run TestCorpus -check-parse 'FRAGMENT' # dump detail for it
 go test ./parser                                        # gate
 ```
 
-Oracle rejects raised by upstream's *transformer* (Parser Errors whose
-message is not "syntax error at or near ...") that darkwing's transformer
-does not reproduce yet stay in todo metadata with a note saying why; the
-harness flags todo entries that start agreeing so they get removed.
+Since milestone 5 every statement has a transformer and the upstream
+transformer's own Parser Errors are reproduced. The remaining todo
+entries cover oracle rejects raised *outside* the parse pipeline —
+bind-time validation that happens to throw ParserException (setting
+values, function argument checks, PRIMARY KEY verification) and nested
+SQL parsing inside functions like query() and nextval() — each with a
+note saying why; the harness flags todo entries that start agreeing so
+they get removed.
 
 Sweeping tree shapes against a live oracle (milestones 3-4 exit
 criteria: zero mismatches over the corpus SELECT subset):

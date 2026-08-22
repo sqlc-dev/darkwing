@@ -9,6 +9,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/sqlc-dev/darkwing/ast"
 	"github.com/sqlc-dev/darkwing/internal/matcher"
@@ -114,6 +115,9 @@ func (tc *transformContext) transformSingle(n tnode) ast.Expr {
 		if err != nil {
 			raise("invalid positional reference")
 		}
+		if idx == 0 {
+			raise("Positional reference node needs to be >= 1")
+		}
 		p := &ast.PositionalReferenceExpression{Index: idx}
 		p.SetSpan(alt.span())
 		return p
@@ -183,7 +187,15 @@ func (tc *transformContext) stringConstant(sp ast.Span, s string, kind matcher.S
 		cast.SetSpan(sp)
 		return cast
 	case matcher.StringEscape:
-		return constExpr(sp, varcharValue(unescapeString(s)))
+		unescaped := unescapeString(s)
+		if strings.IndexByte(unescaped, 0) >= 0 {
+			raise("Null character not permitted in escape string literal")
+		}
+		if !utf8.ValidString(unescaped) {
+			raise("Invalid UTF-8 in escape string literal at byte offset %d: invalid unicode codepoint",
+				invalidUTF8Offset(unescaped))
+		}
+		return constExpr(sp, varcharValue(unescaped))
 	default:
 		return constExpr(sp, varcharValue(s))
 	}
@@ -236,6 +248,19 @@ func unescapeString(s string) string {
 		}
 	}
 	return sb.String()
+}
+
+// invalidUTF8Offset finds the first invalid byte offset of a non-UTF-8
+// string (for the escape-literal error message).
+func invalidUTF8Offset(s string) int {
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && size == 1 {
+			return i
+		}
+		i += size
+	}
+	return len(s)
 }
 
 func isHexDigit(c byte) bool {
@@ -533,6 +558,7 @@ func (tc *transformContext) transformStar(n tnode) ast.Expr {
 		}
 		star.RelationName = strings.Join(parts, ".")
 	}
+	var excludePaths [][]string
 	if excl, ok := n.child(2).opt(); ok {
 		// ExcludeList <- ExcludeOrExcept ExcludeNames
 		_, names := excl.child(1).sole().choice()
@@ -544,14 +570,28 @@ func (tc *transformContext) transformStar(n tnode) ast.Expr {
 		}
 		for _, e := range entries {
 			path := excludeNamePath(e)
+			for _, prev := range excludePaths {
+				if qualifiedColumnsMatch(prev, path) {
+					raise("Duplicate entry \"%s\" in EXCLUDE list", strings.Join(path, "."))
+				}
+			}
+			excludePaths = append(excludePaths, path)
 			if len(path) == 1 {
 				star.ExcludeList = append(star.ExcludeList, path[0])
 			} else {
 				star.QualifiedExcludeList = append(star.QualifiedExcludeList, ast.QualifiedColumnName{Path: path})
 			}
 		}
-
 	}
+	inExclude := func(path []string) bool {
+		for _, prev := range excludePaths {
+			if qualifiedColumnsMatch(prev, path) {
+				return true
+			}
+		}
+		return false
+	}
+	replaced := map[string]bool{}
 	if repl, ok := n.child(3).opt(); ok {
 		// ReplaceList <- 'REPLACE' ReplaceEntries
 		_, entriesAlt := repl.child(1).sole().choice()
@@ -569,7 +609,17 @@ func (tc *transformContext) transformStar(n tnode) ast.Expr {
 			if !ok || len(cr.ColumnNames) != 1 {
 				raise("REPLACE target must be a single column name")
 			}
-			star.ReplaceList = append(star.ReplaceList, ast.StarReplaceEntry{Key: cr.ColumnNames[0], Expr: expr})
+			key := cr.ColumnNames[0]
+			if replaced[strings.ToLower(key)] {
+				raise("Duplicate entry \"%s\" in REPLACE list", key)
+			}
+			replaced[strings.ToLower(key)] = true
+			star.ReplaceList = append(star.ReplaceList, ast.StarReplaceEntry{Key: key, Expr: expr})
+		}
+		for _, r := range star.ReplaceList {
+			if inExclude([]string{r.Key}) {
+				raise("Column \"%s\" cannot occur in both EXCLUDE and REPLACE list", r.Key)
+			}
 		}
 	}
 	if ren, ok := n.child(4).opt(); ok {
@@ -589,8 +639,39 @@ func (tc *transformContext) transformStar(n tnode) ast.Expr {
 				Name: identifierText(e.child(2)),
 			})
 		}
+		for _, r := range star.RenameList {
+			if inExclude(r.Key.Path) {
+				raise("Column \"%s\" cannot occur in both EXCLUDE and RENAME list", strings.Join(r.Key.Path, "."))
+			}
+			if replaced[strings.ToLower(r.Key.Path[len(r.Key.Path)-1])] {
+				raise("Column \"%s\" cannot occur in both REPLACE and RENAME list", strings.Join(r.Key.Path, "."))
+			}
+		}
 	}
 	return star
+}
+
+// qualifiedColumnsMatch ports upstream's QualifiedColumnEquality: dotted
+// exclude/rename paths compare by column name, with missing qualifiers
+// acting as wildcards ("tbl.i" matches "i" but not "tbl2.i").
+func qualifiedColumnsMatch(a, b []string) bool {
+	if !strings.EqualFold(a[len(a)-1], b[len(b)-1]) {
+		return false
+	}
+	aq, bq := a[:len(a)-1], b[:len(b)-1]
+	for i := 1; i <= 3; i++ {
+		var av, bv string
+		if len(aq) >= i {
+			av = aq[len(aq)-i]
+		}
+		if len(bq) >= i {
+			bv = bq[len(bq)-i]
+		}
+		if av != "" && bv != "" && !strings.EqualFold(av, bv) {
+			return false
+		}
+	}
+	return true
 }
 
 // excludeNamePath extracts the dotted path of an ExcludeName.

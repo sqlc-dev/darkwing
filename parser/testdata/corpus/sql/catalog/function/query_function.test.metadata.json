@@ -1,14 +1,14 @@
 {
-  "todo": {
-    "2dbe98fbfd26e976": "transformer-raised parser error: upstream rejects in the transformer, not the grammar; expected to clear as transformers land (milestones 3-5)",
-    "6849cf25332caa00": "transformer-raised parser error: upstream rejects in the transformer, not the grammar; expected to clear as transformers land (milestones 3-5)",
-    "aa55a1e51d55e50f": "transformer-raised parser error: upstream rejects in the transformer, not the grammar; expected to clear as transformers land (milestones 3-5)",
-    "b1a7071252780b40": "transformer-raised parser error: upstream rejects in the transformer, not the grammar; expected to clear as transformers land (milestones 3-5)",
-    "c0ff2e8320e39445": "transformer-raised parser error: upstream rejects in the transformer, not the grammar; expected to clear as transformers land (milestones 3-5)",
-    "c5d546a35986dc04": "transformer-raised parser error: upstream rejects in the transformer, not the grammar; expected to clear as transformers land (milestones 3-5)"
-  },
   "skip": {
     "5f81be9e9bc42318": "nested parse at bind time: the inner SQL string is parsed by a function, the grammar never sees it",
     "f84558899aa09cea": "nested parse at bind time: the inner SQL string is parsed by a function, the grammar never sees it"
+  },
+  "todo": {
+    "2dbe98fbfd26e976": "oracle's Parser Error comes from outside the parse pipeline (bind-time setting/function/constraint validation or nested SQL parsing); darkwing accepts by design - revisit with milestone 6 error-fidelity work",
+    "6849cf25332caa00": "oracle's Parser Error comes from outside the parse pipeline (bind-time setting/function/constraint validation or nested SQL parsing); darkwing accepts by design - revisit with milestone 6 error-fidelity work",
+    "aa55a1e51d55e50f": "oracle's Parser Error comes from outside the parse pipeline (bind-time setting/function/constraint validation or nested SQL parsing); darkwing accepts by design - revisit with milestone 6 error-fidelity work",
+    "b1a7071252780b40": "oracle's Parser Error comes from outside the parse pipeline (bind-time setting/function/constraint validation or nested SQL parsing); darkwing accepts by design - revisit with milestone 6 error-fidelity work",
+    "c0ff2e8320e39445": "oracle's Parser Error comes from outside the parse pipeline (bind-time setting/function/constraint validation or nested SQL parsing); darkwing accepts by design - revisit with milestone 6 error-fidelity work",
+    "c5d546a35986dc04": "oracle's Parser Error comes from outside the parse pipeline (bind-time setting/function/constraint validation or nested SQL parsing); darkwing accepts by design - revisit with milestone 6 error-fidelity work"
   }
 }

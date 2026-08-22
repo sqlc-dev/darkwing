@@ -1,12 +1,12 @@
-// transform_ddl.go: CREATE / ALTER / DROP — the milestone-4 DDL
-// transformers: tables (columns + constraints), views, schemas, indexes,
-// sequences and types. CREATE MACRO / SECRET / TRIGGER belong to
-// milestone 5 and report ErrUnsupported. Port of upstream's
-// transformer/statement/transform_create_*.cpp, transform_alter.cpp and
-// transform_drop.cpp.
+// transform_ddl.go: CREATE / ALTER / DROP — the DDL transformers: tables
+// (columns + constraints), views, schemas, indexes, sequences and types
+// (CREATE MACRO / SECRET / TRIGGER live in transform_create_misc.go).
+// Port of upstream's transformer/statement/transform_create_*.cpp,
+// transform_alter.cpp and transform_drop.cpp.
 package parser
 
 import (
+	"math"
 	"strings"
 
 	"github.com/sqlc-dev/darkwing/ast"
@@ -55,8 +55,12 @@ func (tc *transformContext) transformCreate(n tnode) ast.Stmt {
 		info = tc.transformCreateSequence(variation)
 	case "CreateTypeStmt":
 		info = tc.transformCreateType(variation)
-	case "CreateMacroStmt", "CreateSecretStmt", "CreateTriggerStmt":
-		panic(&internalErrorUnsupported{rule: variation.name()})
+	case "CreateMacroStmt":
+		info = tc.transformCreateMacro(variation)
+	case "CreateSecretStmt":
+		info = tc.transformCreateSecret(variation)
+	case "CreateTriggerStmt":
+		info = tc.transformCreateTrigger(variation)
 	default:
 		shapeError(variation, "unknown create variation")
 	}
@@ -159,6 +163,16 @@ func (tc *transformContext) transformColumnDefinition(n tnode) ast.ColumnDef {
 			}
 		}
 	}
+	if col.Type == nil && col.Generated == "" {
+		raise("Column %s must have a type or be defined as a GENERATED column.", strings.Join(col.Names, "."))
+	}
+	if col.Generated != "" {
+		name := col.Names[len(col.Names)-1]
+		if hasSubquery(col.Default) {
+			raise("Expression of generated column \"%s\" contains a subquery, which isn't allowed", name)
+		}
+		verifyGeneratedColumnRefs(col.Default)
+	}
 	constraintName := ""
 	if named, ok := n.child(3).opt(); ok {
 		constraintName = identifierText(named.child(1))
@@ -166,7 +180,15 @@ func (tc *transformContext) transformColumnDefinition(n tnode) ast.ColumnDef {
 	for _, c := range n.child(4).repeat() {
 		constraint := tc.transformColumnConstraint(&col, c)
 		if constraint == nil {
+			if col.Generated != "" && col.Collation != "" {
+				raise("Collations are not supported on generated columns")
+			}
 			continue
+		}
+		if col.Generated != "" {
+			if _, isDefault := constraint.(*ast.DefaultConstraint); isDefault {
+				raise("Not allowed to set default on a generated column")
+			}
 		}
 		if constraintName != "" {
 			setConstraintName(constraint, constraintName)
@@ -226,7 +248,7 @@ func (tc *transformContext) transformColumnConstraint(col *ast.ColumnDef, n tnod
 		c.SetSpan(alt.span())
 		return c
 	case "CheckConstraint":
-		c := &ast.CheckConstraint{Expr: tc.transformExpression(alt.child(1).parens())}
+		c := &ast.CheckConstraint{Expr: checkConstraintExpr(tc.transformExpression(alt.child(1).parens()))}
 		c.SetSpan(alt.span())
 		return c
 	case "ForeignKeyConstraint":
@@ -273,6 +295,11 @@ func (tc *transformContext) transformForeignKey(n tnode, columns []string) *ast.
 	if da, ok := actions.child(1).opt(); ok {
 		c.OnDelete = keyAction(da.child(2))
 	}
+	// the table-level form checks the column counts (upstream's
+	// TransformTopForeignKeyConstraint, after the actions transform)
+	if len(c.Columns) > 0 && len(c.ReferencedColumns) > 0 && len(c.Columns) != len(c.ReferencedColumns) {
+		raise("The number of referencing and referenced columns for foreign keys must be the same")
+	}
 	return c
 }
 
@@ -283,15 +310,53 @@ func keyAction(n tnode) ast.KeyAction {
 		return ast.KeyActionNone
 	case "RestrictKeyAction":
 		return ast.KeyActionRestrict
-	case "CascadeKeyAction":
-		return ast.KeyActionCascade
-	case "SetNullKeyAction":
-		return ast.KeyActionSetNull
-	case "SetDefaultKeyAction":
-		return ast.KeyActionSetDefault
+	case "CascadeKeyAction", "SetNullKeyAction", "SetDefaultKeyAction":
+		// DuckDB does not support referential actions
+		raise("FOREIGN KEY constraints cannot use CASCADE, SET NULL or SET DEFAULT")
 	}
 	shapeError(alt, "unknown key action")
 	return ""
+}
+
+// verifyGeneratedColumnRefs ports VerifyColumnRefs: generated column
+// expressions cannot contain qualified column references.
+func verifyGeneratedColumnRefs(e ast.Expr) {
+	if e == nil {
+		return
+	}
+	if ref, ok := e.(*ast.ColumnRefExpression); ok && len(ref.ColumnNames) > 1 {
+		raise("Qualified (tbl.name) column references are not allowed inside of generated column expressions")
+	}
+	for _, child := range e.Children() {
+		if expr, ok := child.(ast.Expr); ok {
+			verifyGeneratedColumnRefs(expr)
+		}
+	}
+}
+
+// hasSubquery reports whether the expression tree contains a subquery
+// (upstream's ParsedExpression::HasSubquery).
+func hasSubquery(e ast.Expr) bool {
+	if e == nil {
+		return false
+	}
+	if _, ok := e.(*ast.SubqueryExpression); ok {
+		return true
+	}
+	for _, child := range e.Children() {
+		if expr, ok := child.(ast.Expr); ok && hasSubquery(expr) {
+			return true
+		}
+	}
+	return false
+}
+
+// checkConstraintExpr guards a CHECK constraint body.
+func checkConstraintExpr(e ast.Expr) ast.Expr {
+	if hasSubquery(e) {
+		raise("subqueries prohibited in CHECK constraints")
+	}
+	return e
 }
 
 // TopLevelConstraint <- ConstraintNameClause? TopLevelConstraintList
@@ -314,7 +379,7 @@ func (tc *transformContext) transformTopLevelConstraint(n tnode) ast.Constraint 
 		out = c
 	case "TopCheckConstraint":
 		inner := alt.sole()
-		c := &ast.CheckConstraint{Expr: tc.transformExpression(inner.child(1).parens())}
+		c := &ast.CheckConstraint{Expr: checkConstraintExpr(tc.transformExpression(inner.child(1).parens()))}
 		c.SetSpan(alt.span())
 		out = c
 	case "TopForeignKeyConstraint":
@@ -358,6 +423,7 @@ func (tc *transformContext) transformCreateView(n tnode) ast.CreateInfo {
 		info.Aliases = identifierList(cols.sole().parens())
 	}
 	info.Query = tc.transformSelectInternalStatement(n.child(7))
+	tc.pivotEntryCheck("view")
 	return info
 }
 
@@ -404,19 +470,181 @@ func (tc *transformContext) transformCreateIndex(n tnode) ast.CreateInfo {
 	return info
 }
 
+// sequenceOptionKey names an option for duplicate detection (upstream's
+// option pair keys).
+func sequenceOptionKey(alt tnode) string {
+	switch alt.name() {
+	case "SeqSetCycle":
+		return "cycle"
+	case "SeqSetIncrement":
+		return "increment"
+	case "SeqSetMinMax":
+		if seqIsMin(alt.child(0)) {
+			return "minvalue"
+		}
+		return "maxvalue"
+	case "SeqNoMinMax":
+		if seqIsMin(alt.child(1)) {
+			return "nominvalue"
+		}
+		return "nomaxvalue"
+	case "SeqStartWith":
+		return "start"
+	case "SeqOwnedBy":
+		return "owned"
+	}
+	shapeError(alt, "unknown sequence option")
+	return ""
+}
+
+// seqConstant requires a sequence option value to fold to a constant
+// (upstream's TransformSeqSet* transforms; negated literals are already
+// folded by the expression transformer).
+func seqConstant(e ast.Expr) ast.Value {
+	c, ok := e.(*ast.ConstantExpression)
+	if !ok {
+		raise("Expected constant expression.")
+	}
+	return c.Value
+}
+
+// seqInt extracts an int64 option value. Non-integer constants fail
+// upstream with a conversion error (post-parse), so ok=false skips the
+// parse-time range checks.
+func seqInt(v ast.Value) (int64, bool) {
+	if v.Kind == ast.ValueInt64 {
+		return v.Int64, true
+	}
+	return 0, false
+}
+
 // CreateSequenceStmt <- 'SEQUENCE' IfNotExists? QualifiedName SequenceOption*
+// Port of TransformCreateSequenceStmt, including its parse-time option
+// validation: duplicates, NULL values, zero increments and the
+// min/max/start range checks over the evaluated defaults.
 func (tc *transformContext) transformCreateSequence(n tnode) ast.CreateInfo {
 	info := &ast.CreateSequenceInfo{}
 	info.SetSpan(n.span())
 	applyIfNotExists(&info.CreateInfoBase, n.child(1))
 	tc.fillQualifiedName(&info.CreateInfoBase, n.child(2))
-	for _, opt := range n.child(3).repeat() {
-		tc.applySequenceOption(info, opt)
+
+	seen := map[string]bool{}
+	inc, minV, maxV, start := int64(1), int64(1), int64(math.MaxInt64), int64(0)
+	minSet, maxSet, startSet := false, false, false
+	evalOK := true
+	for _, o := range n.child(3).repeat() {
+		_, alt := o.sole().choice()
+		key := sequenceOptionKey(alt)
+		if seen[key] {
+			raise("%s should be passed at most once", strings.ToUpper(key[:1])+key[1:])
+		}
+		seen[key] = true
+		switch alt.name() {
+		case "SeqSetCycle":
+			_, kind := alt.sole().choice()
+			info.Cycle = kind.name() == "SeqCycle"
+		case "SeqSetIncrement":
+			// 'INCREMENT' 'BY'? Expression
+			info.Increment = tc.transformExpression(alt.child(2))
+			v := seqConstant(info.Increment)
+			if v.IsNull {
+				raise("INCREMENT must not be NULL")
+			}
+			if iv, ok := seqInt(v); ok {
+				inc = iv
+				if inc == 0 {
+					raise("Increment must not be zero")
+				}
+			} else {
+				evalOK = false
+			}
+		case "SeqSetMinMax":
+			// SeqMinOrMax Expression
+			expr := tc.transformExpression(alt.child(1))
+			v := seqConstant(expr)
+			if seqIsMin(alt.child(0)) {
+				info.MinValue = expr
+				if v.IsNull {
+					raise("MINVALUE must not be NULL")
+				}
+				if iv, ok := seqInt(v); ok {
+					minV, minSet = iv, true
+				} else {
+					evalOK = false
+				}
+			} else {
+				info.MaxValue = expr
+				if v.IsNull {
+					raise("MAXVALUE must not be NULL")
+				}
+				if iv, ok := seqInt(v); ok {
+					maxV, maxSet = iv, true
+				} else {
+					evalOK = false
+				}
+			}
+		case "SeqNoMinMax":
+			// 'NO' SeqMinOrMax
+			if seqIsMin(alt.child(1)) {
+				info.NoMinValue = true
+			} else {
+				info.NoMaxValue = true
+			}
+		case "SeqStartWith":
+			// 'START' 'WITH'? Expression
+			info.StartValue = tc.transformExpression(alt.child(2))
+			v := seqConstant(info.StartValue)
+			if v.IsNull {
+				raise("START value must not be NULL")
+			}
+			if iv, ok := seqInt(v); ok {
+				start, startSet = iv, true
+			} else {
+				evalOK = false
+			}
+		case "SeqOwnedBy":
+			// OWNED BY is an ALTER SEQUENCE option upstream
+			raise("Unrecognized option \"owned\" for CREATE SEQUENCE")
+		}
+	}
+	if seen["nominvalue"] && seen["minvalue"] {
+		raise("Minvalue should be passed at most once")
+	}
+	if seen["nomaxvalue"] && seen["maxvalue"] {
+		raise("Maxvalue should be passed at most once")
+	}
+	if evalOK {
+		if inc < 0 {
+			if !minSet {
+				minV = math.MinInt64
+			}
+			if !maxSet {
+				maxV = -1
+			}
+		}
+		if !startSet {
+			if inc < 0 {
+				start = maxV
+			} else {
+				start = minV
+			}
+		}
+		if maxV <= minV {
+			raise("MINVALUE (%d) must be less than MAXVALUE (%d)", minV, maxV)
+		}
+		if start < minV {
+			raise("START value (%d) cannot be less than MINVALUE (%d)", start, minV)
+		}
+		if start > maxV {
+			raise("START value (%d) cannot be greater than MAXVALUE (%d)", start, maxV)
+		}
 	}
 	return info
 }
 
-// applySequenceOption maps one SequenceOption.
+// applySequenceOption maps one SequenceOption for ALTER SEQUENCE. The
+// option transforms still require constant values (upstream raises in the
+// per-option transforms); the CREATE-only NULL/range checks do not apply.
 func (tc *transformContext) applySequenceOption(info *ast.CreateSequenceInfo, n tnode) {
 	_, alt := n.sole().choice()
 	switch alt.name() {
@@ -426,9 +654,11 @@ func (tc *transformContext) applySequenceOption(info *ast.CreateSequenceInfo, n 
 	case "SeqSetIncrement":
 		// 'INCREMENT' 'BY'? Expression
 		info.Increment = tc.transformExpression(alt.child(2))
+		seqConstant(info.Increment)
 	case "SeqSetMinMax":
 		// SeqMinOrMax Expression
 		expr := tc.transformExpression(alt.child(1))
+		seqConstant(expr)
 		if seqIsMin(alt.child(0)) {
 			info.MinValue = expr
 		} else {
@@ -444,6 +674,7 @@ func (tc *transformContext) applySequenceOption(info *ast.CreateSequenceInfo, n 
 	case "SeqStartWith":
 		// 'START' 'WITH'? Expression
 		info.StartValue = tc.transformExpression(alt.child(2))
+		seqConstant(info.StartValue)
 	case "SeqOwnedBy":
 		cat, schema, name := tc.transformQualifiedNameParts(alt.child(2))
 		info.OwnedBy = &ast.QualifiedName{Catalog: cat, Schema: schema, Name: name}
@@ -501,6 +732,9 @@ func (tc *transformContext) transformAlter(n tnode) ast.Stmt {
 		for _, opt := range alt.child(3).listElems() {
 			stmt.Actions = append(stmt.Actions, tc.transformAlterTableOption(opt))
 		}
+		if len(stmt.Actions) > 1 {
+			raise("Only one ALTER command per statement is supported")
+		}
 	case "AlterViewStmt":
 		// 'VIEW' IfExists? BaseTableName RenameAlter
 		stmt.Entity = ast.AlterEntityView
@@ -521,7 +755,15 @@ func (tc *transformContext) transformAlter(n tnode) ast.Stmt {
 		case "SetSequenceOption":
 			seq := &ast.SetSequenceOptionInfo{}
 			seq.SetSpan(opts.span())
+			seenOwned := false
 			for _, o := range opts.sole().repeat() {
+				_, optAlt := o.sole().choice()
+				if optAlt.name() == "SeqOwnedBy" {
+					if seenOwned {
+						raise("Owned by value should be passed at most once")
+					}
+					seenOwned = true
+				}
 				tc.applySequenceOption(&seq.Options, o)
 			}
 			stmt.Actions = append(stmt.Actions, seq)
@@ -612,6 +854,12 @@ func (tc *transformContext) transformAlterTableOption(n tnode) ast.AlterInfo {
 				}
 			}
 		}
+		if col.Type == nil && col.Generated == "" {
+			raise("Column definition requires a type or generated expression")
+		}
+		if col.Generated != "" {
+			raise("Adding generated columns after table creation is not supported yet")
+		}
 		for _, c := range entry.child(3).repeat() {
 			if constraint := tc.transformColumnConstraint(&col, c); constraint != nil {
 				col.Constraints = append(col.Constraints, constraint)
@@ -677,10 +925,31 @@ func (tc *transformContext) transformAlterTableOption(n tnode) ast.AlterInfo {
 	case "ResetOptions":
 		info := &ast.GenericAlterInfo{Kind: "RESET_OPTIONS"}
 		info.SetSpan(alt.span())
+		// RESET (...) options cannot carry values (a bare NULL passes,
+		// mirroring upstream's null-constant default)
+		for _, o := range alt.child(1).parens().listElems() {
+			// RelOption <- RelOptionName RelOptionArgumentOpt?
+			if arg, ok := o.child(1).opt(); ok {
+				// RelOptionArgumentOpt <- '=' DefArg
+				_, def := arg.child(1).sole().choice()
+				if def.name() != "DefArgNull" {
+					raise("Reset option \"%s\" cannot set any value. Did you mean to use SET?", relOptionName(o.child(0)))
+				}
+			}
+		}
 		return info
 	}
 	shapeError(alt, "unknown alter table option")
 	return nil
+}
+
+// relOptionName reads a RelOptionName (DottedIdentifierString / StringLiteral).
+func relOptionName(n tnode) string {
+	_, alt := n.sole().choice()
+	if alt.name() == "DottedIdentifierString" {
+		return strings.Join(dottedIdentifier(alt.sole()), ".")
+	}
+	return identifierText(alt)
 }
 
 // transformOrderByExpressionsNode maps a bare OrderByExpressions node
@@ -733,6 +1002,9 @@ func (tc *transformContext) transformAlterColumnEntry(column []string, n tnode, 
 		}
 		if using, ok := alt.child(3).opt(); ok {
 			info.Using = tc.transformExpression(using.child(1))
+		}
+		if info.Type == nil && info.Using == nil {
+			raise("Omitting the type is only possible in combination with USING")
 		}
 		return info
 	}

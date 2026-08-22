@@ -1,7 +1,7 @@
 {
   "todo": {
-    "24a5d9123261c84d": "transformer-raised parser error: upstream rejects in the transformer, not the grammar; expected to clear as transformers land (milestones 3-5)",
-    "91b15dc29617d59c": "transformer-raised parser error: upstream rejects in the transformer, not the grammar; expected to clear as transformers land (milestones 3-5)",
-    "b542c6a3df03ddb8": "transformer-raised parser error: upstream rejects in the transformer, not the grammar; expected to clear as transformers land (milestones 3-5)"
+    "24a5d9123261c84d": "oracle's Parser Error comes from outside the parse pipeline (bind-time setting/function/constraint validation or nested SQL parsing); darkwing accepts by design - revisit with milestone 6 error-fidelity work",
+    "91b15dc29617d59c": "oracle's Parser Error comes from outside the parse pipeline (bind-time setting/function/constraint validation or nested SQL parsing); darkwing accepts by design - revisit with milestone 6 error-fidelity work",
+    "b542c6a3df03ddb8": "oracle's Parser Error comes from outside the parse pipeline (bind-time setting/function/constraint validation or nested SQL parsing); darkwing accepts by design - revisit with milestone 6 error-fidelity work"
   }
 }

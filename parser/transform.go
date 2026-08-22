@@ -1,11 +1,13 @@
 // transform.go: the transformer registry and shared transform state — the
 // port of upstream's PEGTransformerFactory (transformer/peg_transformer.cpp).
-// One transform function per grammar rule, registered by rule name;
-// rules not in the registry are either consumed structurally by their
-// parent's transformer or belong to later milestones (ErrUnsupported).
+// One transform function per grammar rule, registered by rule name; since
+// milestone 5 every Statement alternative is registered, and rules not in
+// the registry are consumed structurally by their parent's transformer.
 package parser
 
 import (
+	"strings"
+
 	"github.com/sqlc-dev/darkwing/ast"
 )
 
@@ -24,6 +26,29 @@ type transformContext struct {
 	// windows maps named WINDOW definitions of the innermost SELECT
 	// (stack, innermost last).
 	windows []map[string]*ast.WindowExpression
+
+	// inWindowDefinition is set while transforming a window frame
+	// definition; window functions are not allowed inside one.
+	inWindowDefinition bool
+
+	// pivotEntries counts PIVOT columns whose values must be extracted
+	// from the data (no IN list, no enum) — upstream's pivot_entries,
+	// kept as a count since darkwing does not expand them into enum
+	// creation statements. pivotEntryHasParams records whether prepared
+	// parameters had been seen when such an entry was recorded.
+	pivotEntries        int
+	pivotEntryHasParams bool
+}
+
+// pivotEntryCheck ports PEGTransformer::PivotEntryCheck: CREATE VIEW and
+// CREATE MACRO bodies cannot contain pivots whose values come from the
+// data.
+func (tc *transformContext) pivotEntryCheck(kind string) {
+	if tc.pivotEntries > 0 {
+		raise("PIVOT statements with pivot elements extracted from the data cannot be used in %ss.\n"+
+			"In order to use PIVOT in a %s the PIVOT values must be manually specified, e.g.:\n"+
+			"PIVOT ... ON ... IN (val1, val2, ...)", kind, kind)
+	}
 }
 
 func newTransformContext(src string) *transformContext {
@@ -45,55 +70,15 @@ func register(rule string, fn stmtTransform) {
 	statementTransforms[rule] = fn
 }
 
-// unsupportedStatements names the Statement alternatives that belong to
-// milestone 5; the engine accepts them but Parse reports ErrUnsupported.
-var unsupportedStatements = map[string]bool{
-	"ExternalResourceStatement": true, // INSTALL/LOAD/UPDATE EXTENSIONS/...
-	"SetStatement":              true,
-	"PragmaStatement":           true,
-	"CallStatement":             true,
-	"CopyStatement":             true,
-	"ExplainStatement":          true,
-	"PrepareStatement":          true,
-	"ExecuteStatement":          true,
-	"TransactionStatement":      true,
-	"AttachStatement":           true,
-	"UseStatement":              true,
-	"DetachStatement":           true,
-	"CheckpointStatement":       true,
-	"VacuumStatement":           true,
-	"ResetStatement":            true,
-	"ExportStatement":           true,
-	"ImportStatement":           true,
-	"CommentStatement":          true,
-	"DeallocateStatement":       true,
-	"LoadStatement":             true,
-	"InstallStatement":          true,
-	"UpdateExtensionsStatement": true,
-	"AnalyzeStatement":          true,
-	"ConnectStatement":          true,
-	"DisconnectStatement":       true,
-}
-
 // transformStatement dispatches one Statement node (LIST(Statement)
 // wrapping a choice of statement rules).
 func (tc *transformContext) transformStatement(n tnode) ast.Stmt {
 	_, inner := n.sole().choice()
-	name := inner.name()
-	if fn, ok := statementTransforms[name]; ok {
+	if fn, ok := statementTransforms[inner.name()]; ok {
 		return fn(tc, inner)
-	}
-	if unsupportedStatements[name] {
-		panic(&internalErrorUnsupported{rule: name})
 	}
 	shapeError(inner, "no statement transform registered")
 	return nil
-}
-
-// internalErrorUnsupported is panicked for milestone-5 statements and
-// converted to *unsupportedError at the Parse boundary.
-type internalErrorUnsupported struct {
-	rule string
 }
 
 // finishStatement attaches the collected parameter map to the statement.
@@ -124,6 +109,26 @@ func (tc *transformContext) finishStatement(stmt ast.Stmt) {
 		s.NamedParams = params
 	case *ast.AlterStatement:
 		s.NamedParams = params
+	case *ast.SetStatement:
+		s.NamedParams = params
+	case *ast.PragmaStatement:
+		s.NamedParams = params
+	case *ast.CallStatement:
+		s.NamedParams = params
+	case *ast.ExplainStatement:
+		s.NamedParams = params
+	case *ast.ExecuteStatement:
+		s.NamedParams = params
+	case *ast.CopyStatement:
+		s.NamedParams = params
+	case *ast.AttachStatement:
+		s.NamedParams = params
+	case *ast.ConnectStatement:
+		s.NamedParams = params
+	case *ast.ExportStatement:
+		s.NamedParams = params
+	case *ast.ExternalResourceStatement:
+		s.NamedParams = params
 	}
 }
 
@@ -151,9 +156,9 @@ func (tc *transformContext) registerParam(p *ast.ParameterExpression) {
 			p.Number = tc.paramCount
 		}
 	}
-	if tc.hasNamed && tc.hasPosition {
-		raise("Mixing named and positional parameters is not supported yet")
-	}
+	// mixing named and positional parameters raises NotImplemented
+	// upstream (post-parse for the corpus oracle), so darkwing keeps
+	// numbering and accepts
 	id := p.Identifier()
 	if _, ok := tc.paramSeen[id]; !ok {
 		tc.paramSeen[id] = p.Number
@@ -171,10 +176,12 @@ func (tc *transformContext) popWindowScope() {
 	tc.windows = tc.windows[:len(tc.windows)-1]
 }
 
-// namedWindow resolves a window name in the innermost scope.
+// namedWindow resolves a window name in the innermost scope (window
+// names are case-insensitive identifiers).
 func (tc *transformContext) namedWindow(name string) *ast.WindowExpression {
+	key := strings.ToLower(name)
 	for i := len(tc.windows) - 1; i >= 0; i-- {
-		if w, ok := tc.windows[i][name]; ok {
+		if w, ok := tc.windows[i][key]; ok {
 			return w
 		}
 	}
@@ -186,8 +193,9 @@ func (tc *transformContext) defineWindow(name string, w *ast.WindowExpression) {
 		tc.pushWindowScope()
 	}
 	scope := tc.windows[len(tc.windows)-1]
-	if _, dup := scope[name]; dup {
+	key := strings.ToLower(name)
+	if _, dup := scope[key]; dup {
 		raise("window \"%s\" is already defined", name)
 	}
-	scope[name] = w
+	scope[key] = w
 }

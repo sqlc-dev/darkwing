@@ -152,6 +152,10 @@ func TestErrorMessages(t *testing.T) {
 		// a deeper operand error beats the chained-comparison ban
 		{"SELECT 1 < 2 < [3][]", "Parser Error: Empty subscript '[]' is not allowed"},
 		{"SELECT 1 < 2 < 3", "Parser Error: Chained comparisons are not supported, use AND to combine comparisons"},
+		// the offending token's raw spelling goes between plain quotes
+		// with no escaping (found by cmd/difftest)
+		{`TABLE ALTER "other name" RENAME`, `Parser Error: syntax error at or near ""other name""`},
+		{`SELECT E'\\' = '\' '\';`, `Parser Error: syntax error at or near "'\'"`},
 	}
 	for _, tt := range tests {
 		pe := rejectError(t, tt.sql)

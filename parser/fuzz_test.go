@@ -67,6 +67,7 @@ var fuzzSeeds = []string{
 	"SELECT [x + 1 FOR x IN [1,2,3] IF x > 1], l[1:3:2], r['k'], s.*.x",
 	"SELECT interval '2 10' years to months",
 	"SELECT e'\\x41\\n' || $tag$body$tag$ || 'lit''eral'",
+	"SELECT $$'''$$", // rewritten literal longer than its source extent
 	"SELECT a -> '$.b' ->> 'c' FROM j -- comment\n/* block /* nested */ */",
 	"ATTACH 'f.db' AS d (READ_ONLY); USE d; SET threads = 4;",
 	"SELECT (((((((1",

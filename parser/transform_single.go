@@ -6,6 +6,7 @@ package parser
 
 import (
 	"errors"
+	"fmt"
 	"math"
 	"strconv"
 	"strings"
@@ -295,13 +296,26 @@ func integerTypeFor(v int64) string {
 // INTEGER/BIGINT/HUGEINT (then DOUBLE), plain decimals become DECIMAL
 // with derived width/scale (up to width 38), exponent forms become
 // DOUBLE.
+// unconvertibleNumber stands in for a number literal whose text has no
+// value (e.g. "2.03.0", tokenized as a single number): upstream accepts
+// the token and throws InvalidInputException while constructing the
+// value ("Could not convert string ... to DECIMAL(5,1)") — post-parse
+// under the oracle's classification — so darkwing records the raw text
+// as a cast to the derived type and accepts (found by cmd/difftest).
+func unconvertibleNumber(sp ast.Span, text, typeID string) ast.Expr {
+	child := constExpr(invalidSpan, varcharValue(text))
+	cast := &ast.CastExpression{Child: child, ResolvedType: typeID}
+	cast.SetSpan(sp)
+	return cast
+}
+
 func numberConstant(sp ast.Span, text string) ast.Expr {
 	clean := strings.ReplaceAll(text, "_", "")
 	lower := strings.ToLower(clean)
 	if strings.ContainsAny(lower, "e") {
 		f, err := parseDouble(clean)
 		if err != nil {
-			raise("invalid number literal \"%s\"", text)
+			return unconvertibleNumber(sp, clean, "DOUBLE")
 		}
 		return constExpr(sp, ast.Value{Type: ast.LogicalType{ID: "DOUBLE"}, Kind: ast.ValueDouble, Float64: f})
 	}
@@ -320,7 +334,7 @@ func numberConstant(sp ast.Span, text string) ast.Expr {
 	}
 	f, err := parseDouble(clean)
 	if err != nil {
-		raise("invalid number literal \"%s\"", text)
+		return unconvertibleNumber(sp, clean, "DOUBLE")
 	}
 	return constExpr(sp, ast.Value{Type: ast.LogicalType{ID: "DOUBLE"}, Kind: ast.ValueDouble, Float64: f})
 }
@@ -351,7 +365,7 @@ func decimalConstant(sp ast.Span, clean string, dot int) ast.Expr {
 	if width > 38 {
 		f, err := parseDouble(clean)
 		if err != nil {
-			raise("invalid number literal \"%s\"", clean)
+			return unconvertibleNumber(sp, clean, "DOUBLE")
 		}
 		return constExpr(sp, ast.Value{Type: ast.LogicalType{ID: "DOUBLE"}, Kind: ast.ValueDouble, Float64: f})
 	}
@@ -365,7 +379,7 @@ func decimalConstant(sp ast.Span, clean string, dot int) ast.Expr {
 	}
 	h, ok := parseHugeint(unscaled)
 	if !ok {
-		raise("invalid number literal \"%s\"", clean)
+		return unconvertibleNumber(sp, clean, fmt.Sprintf("DECIMAL(%d,%d)", width, scale))
 	}
 	return constExpr(sp, ast.Value{Type: typ, Kind: ast.ValueHugeint, Hugeint: h})
 }

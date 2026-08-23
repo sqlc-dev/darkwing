@@ -469,3 +469,42 @@ func TestSequenceOptionChecks(t *testing.T) {
 	}
 	parseOne(t, "CREATE SEQUENCE s INCREMENT 2 MINVALUE 0 MAXVALUE 100 START 4 CYCLE")
 }
+
+// TestCollateNames pins the collationName port: identifier chains join
+// with '.', constants render via Value::ToString, and anything else —
+// where upstream throws NotImplementedException at bind time — still
+// parses (found by cmd/difftest).
+func TestCollateNames(t *testing.T) {
+	sel := func(sql string) *ast.CollateExpression {
+		t.Helper()
+		stmt := parseOne(t, sql).(*ast.SelectStatement)
+		node := stmt.Node.(*ast.SelectNode)
+		return node.SelectList[0].(*ast.CollateExpression)
+	}
+	for _, tt := range []struct{ sql, collation string }{
+		{"SELECT 'x' COLLATE nocase", "nocase"},
+		{"SELECT 'x' COLLATE a.b", "a.b"},
+		{"SELECT 'x' COLLATE 'lit'", "lit"},
+		{"SELECT 'x' COLLATE NULL", "NULL"},
+		{"SELECT 'x' COLLATE 3.5", "3.5"},
+		{"SELECT 'x' COLLATE true", "true"},
+	} {
+		if c := sel(tt.sql); c.Collation != tt.collation {
+			t.Errorf("%s: collation = %q, want %q", tt.sql, c.Collation, tt.collation)
+		}
+	}
+	// upstream: NotImplementedException (post-parse), so these parse
+	parseOne(t, "SELECT strpos('HELLO WORLD' COLLATE NOCASE 'o w')")
+	parseOne(t, "SELECT 'x' COLLATE $1")
+}
+
+// TestUnconvertibleNumberLiterals: a number token whose text has no
+// value ("2.03.0") still parses — upstream throws InvalidInputException
+// only while constructing the value, which is post-parse under the
+// oracle's classification (found by cmd/difftest).
+func TestUnconvertibleNumberLiterals(t *testing.T) {
+	parseOne(t, "SELECT 2.03.0")
+	parseOne(t, "SELECT list_position([1.0,2.03.0,]::varchar[], 'a')")
+	parseOne(t, "SELECT 12.5.5.5")
+	parseOne(t, "SELECT 999999999999999999999999999999999999999999.1.1")
+}

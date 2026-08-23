@@ -155,12 +155,19 @@ func parseString(ctx context.Context, src string) (stmts []ast.Stmt, err error) 
 
 // consumedEnd returns the byte offset just past the tokens consumed by
 // the match from pos to newPos (excluding the end-of-input sentinel).
+// Dollar-quoted string tokens record the rewritten literal's length
+// rather than the source extent (upstream behavior, pinned by the
+// serialize goldens' query_location_length), so the end is clamped to
+// keep statement spans inside the input they promise to tile.
 func consumedEnd(tokens []token.Token, pos, newPos, srcLen int) int {
 	for i := newPos - 1; i >= pos; i-- {
 		if tokens[i].Kind == token.EndOfInput {
 			continue
 		}
-		return tokens[i].Span.End
+		if end := tokens[i].Span.End; end < srcLen {
+			return end
+		}
+		return srcLen
 	}
 	return srcLen
 }

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -79,6 +80,12 @@ type Verdict struct {
 	// Crashed records that the CLI died before printing a verdict; like
 	// TimedOut, the statement is unverified.
 	Crashed bool
+	// PostParseError records that the CLI reported a non-parser error
+	// (Binder Error, Catalog Error, ...). Still must-accept — but the
+	// batch-mode CLI stops at the first failing statement, so for
+	// multi-statement input everything after that statement went
+	// unparsed and the accept verdict does not cover it.
+	PostParseError bool
 }
 
 // Oracle runs statements through the pinned CLI against :memory:.
@@ -126,6 +133,7 @@ func (o *Oracle) Run(sql string) (Verdict, error) {
 		// execution ran long: parsing succeeded
 		return Verdict{TimedOut: true}, nil
 	}
+	postParse := hasPostParseError(stderr.String())
 	if err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
@@ -137,11 +145,30 @@ func (o *Oracle) Run(sql string) (Verdict, error) {
 			}
 			// plain error exit with a non-parser error on stderr:
 			// post-parse failure, must-accept
-			return Verdict{}, nil
+			return Verdict{PostParseError: postParse}, nil
 		}
 		return Verdict{}, fmt.Errorf("running oracle: %w", err)
 	}
-	return Verdict{}, nil
+	return Verdict{PostParseError: postParse}, nil
+}
+
+// errorLine matches the CLI's non-parser error headers ("Binder Error:",
+// "Catalog Error: ", "Invalid Input Error: ", ...).
+var errorLine = regexp.MustCompile(`^[A-Za-z][A-Za-z ]*Error: `)
+
+// hasPostParseError reports whether stderr carries a non-parser error
+// line.
+func hasPostParseError(stderr string) bool {
+	for _, line := range strings.Split(stderr, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "Parser Error") {
+			continue
+		}
+		if errorLine.MatchString(line) {
+			return true
+		}
+	}
+	return false
 }
 
 // classify scans CLI stderr for the first error line. Only "Parser Error"

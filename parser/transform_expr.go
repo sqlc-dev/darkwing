@@ -6,6 +6,8 @@
 package parser
 
 import (
+	"math/big"
+	"strconv"
 	"strings"
 
 	"github.com/sqlc-dev/darkwing/ast"
@@ -229,8 +231,13 @@ func (tc *transformContext) transformComparison(n tnode) ast.Expr {
 		return expr
 	}
 	if len(tails) > 1 {
-		// upstream bans chained comparisons in the transformer
-		raise("Chained comparisons (e.g. a < b < c) are not supported")
+		// upstream bans chained comparisons in the transformer, but only
+		// after transforming the operands - a deeper operand error (e.g.
+		// an empty subscript) takes precedence over the chain ban
+		for _, tail := range tails {
+			tc.transformBetweenInLike(tail.child(2))
+		}
+		raise("Chained comparisons are not supported, use AND to combine comparisons")
 	}
 	tail := tails[0]
 	_, opAlt := tail.child(0).sole().choice()
@@ -705,7 +712,7 @@ func (tc *transformContext) transformCollate(n tnode) ast.Expr {
 	expr := tc.transformAtTimeZone(n.child(0))
 	for _, tail := range n.child(1).repeat() {
 		rhs := tc.transformAtTimeZone(tail.child(1))
-		collation := collationName(rhs)
+		collation := tc.collationName(rhs)
 		c := &ast.CollateExpression{Child: expr, Collation: collation}
 		c.SetSpan(ast.Span{Start: n.span().Start, End: tail.span().End})
 		expr = c
@@ -714,13 +721,78 @@ func (tc *transformContext) transformCollate(n tnode) ast.Expr {
 }
 
 // collationName extracts the collation name from the right-hand
-// expression of COLLATE (a bare identifier chain).
-func collationName(e ast.Expr) string {
-	ref, ok := e.(*ast.ColumnRefExpression)
-	if !ok {
-		raise("COLLATE expects a collation name")
+// expression of COLLATE: an identifier chain joined with '.', or a
+// constant rendered with Value::ToString semantics ('x' COLLATE 'nocase'
+// and even COLLATE 3 parse; the name fails lookup at bind time). For any
+// other expression upstream throws NotImplementedException ("Unexpected
+// expression encountered for collate, ...") — a post-parse error under
+// the oracle's classification — so darkwing accepts and records the
+// source spelling.
+func (tc *transformContext) collationName(e ast.Expr) string {
+	switch v := e.(type) {
+	case *ast.ColumnRefExpression:
+		return strings.Join(v.ColumnNames, ".")
+	case *ast.ConstantExpression:
+		return valueString(v.Value)
 	}
-	return strings.Join(ref.ColumnNames, ".")
+	return tc.exprSourceText(e)
+}
+
+// valueString ports Value::ToString for the constants the transformer
+// produces.
+func valueString(v ast.Value) string {
+	if v.IsNull {
+		return "NULL"
+	}
+	switch v.Kind {
+	case ast.ValueBool:
+		if v.Bool {
+			return "true"
+		}
+		return "false"
+	case ast.ValueInt64:
+		if v.Type.ID == "DECIMAL" {
+			return decimalValueString(strconv.FormatInt(v.Int64, 10), v.Type.Scale)
+		}
+		return strconv.FormatInt(v.Int64, 10)
+	case ast.ValueHugeint:
+		s := hugeintString(v.Hugeint)
+		if v.Type.ID == "DECIMAL" {
+			return decimalValueString(s, v.Type.Scale)
+		}
+		return s
+	case ast.ValueDouble:
+		return strconv.FormatFloat(v.Float64, 'g', -1, 64)
+	case ast.ValueString:
+		return v.Str
+	}
+	return ""
+}
+
+// hugeintString renders the 128-bit integer in decimal.
+func hugeintString(h ast.Hugeint) string {
+	n := new(big.Int).SetInt64(h.Upper)
+	n.Lsh(n, 64)
+	n.Add(n, new(big.Int).SetUint64(h.Lower))
+	return n.String()
+}
+
+// decimalValueString inserts the decimal point into an unscaled integer
+// rendering, Decimal::ToString-style ("35" scale 1 -> "3.5", "5" scale 2
+// -> "0.05").
+func decimalValueString(digits string, scale int) string {
+	if scale <= 0 {
+		return digits
+	}
+	sign := ""
+	if strings.HasPrefix(digits, "-") {
+		sign, digits = "-", digits[1:]
+	}
+	for len(digits) <= scale {
+		digits = "0" + digits
+	}
+	cut := len(digits) - scale
+	return sign + digits[:cut] + "." + digits[cut:]
 }
 
 // AtTimeZoneExpression <- PrefixExpression AtTimeZoneExpressionTail*
@@ -954,7 +1026,7 @@ func (tc *transformContext) transformSlice(base ast.Expr, n tnode) ast.Expr {
 	endBound, hasEnd := bound.child(1).opt()
 	if !hasEnd {
 		if start == nil {
-			raise("empty subscript is not allowed")
+			raise("Empty subscript '[]' is not allowed")
 		}
 		return opExpr(sp, ast.ArrayExtract, base, start)
 	}

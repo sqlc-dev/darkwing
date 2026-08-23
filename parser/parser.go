@@ -67,6 +67,9 @@ func ParseExpr(ctx context.Context, sql string) (expr ast.Expr, err error) {
 	if err != nil {
 		return nil, err
 	}
+	if ue := validateQueryUTF8(sql); ue != nil {
+		return nil, ue
+	}
 	tokens, err := lexer.Tokenize(sql)
 	if err != nil {
 		return nil, newError(sql, err)
@@ -91,6 +94,10 @@ func parseString(ctx context.Context, src string) (stmts []ast.Stmt, err error) 
 	engine, err := matcher.Default()
 	if err != nil {
 		return nil, err
+	}
+	// the pinned build validates the whole query's UTF-8 before parsing
+	if ue := validateQueryUTF8(src); ue != nil {
+		return nil, ue
 	}
 	tokens, err := lexer.Tokenize(src)
 	if err != nil {
@@ -148,12 +155,19 @@ func parseString(ctx context.Context, src string) (stmts []ast.Stmt, err error) 
 
 // consumedEnd returns the byte offset just past the tokens consumed by
 // the match from pos to newPos (excluding the end-of-input sentinel).
+// Dollar-quoted string tokens record the rewritten literal's length
+// rather than the source extent (upstream behavior, pinned by the
+// serialize goldens' query_location_length), so the end is clamped to
+// keep statement spans inside the input they promise to tile.
 func consumedEnd(tokens []token.Token, pos, newPos, srcLen int) int {
 	for i := newPos - 1; i >= pos; i-- {
 		if tokens[i].Kind == token.EndOfInput {
 			continue
 		}
-		return tokens[i].Span.End
+		if end := tokens[i].Span.End; end < srcLen {
+			return end
+		}
+		return srcLen
 	}
 	return srcLen
 }
@@ -204,6 +218,12 @@ func newError(src string, err error) error {
 	default:
 		msg = err.Error()
 	}
+	return errorAt(src, msg, offset)
+}
+
+// errorAt builds an *Error at a byte offset in src, deriving line and
+// column (offset -1 means no position).
+func errorAt(src, msg string, offset int) *Error {
 	pe := &Error{Msg: msg, Offset: offset, Line: 1, Column: 1}
 	if offset >= 0 {
 		line, col := 1, 1

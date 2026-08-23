@@ -1,0 +1,47 @@
+name: difftest
+
+# The milestone-6 cron lane: differential fuzzing of darkwing against the
+# pinned DuckDB CLI, plus a native fuzz run of the public Parse API. The
+# nightly artifact only matches the pin until upstream moves it, so the
+# lane verifies the version first and skips (green) once it drifts —
+# advancing the pin is its own workflow (cmd/regenerate), not this one.
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  difftest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Download the nightly DuckDB CLI
+        run: |
+          curl -sSL -o duckdb.zip https://artifacts.duckdb.org/latest/duckdb-binaries-linux-amd64.zip
+          unzip -o -q duckdb.zip duckdb_cli-linux-amd64.zip
+          unzip -o -q duckdb_cli-linux-amd64.zip
+          ./duckdb --version
+      - name: Check the nightly against the pin
+        id: pin
+        run: |
+          pin=$(sed -n 's/.*PinnedVersion = "\(.*\)"/\1/p' internal/duckdbsrc/duckdbsrc.go)
+          version=$(./duckdb --version)
+          if echo "$version" | grep -qF "$pin"; then
+            echo "matches=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "matches=false" >> "$GITHUB_OUTPUT"
+            echo "nightly is $version, pin is $pin - skipping until the pin advances"
+          fi
+      - name: Differential fuzzing vs the pinned CLI
+        if: steps.pin.outputs.matches == 'true'
+        run: DARKWING_DUCKDB=$PWD/duckdb go run ./cmd/difftest -seed $(date +%s) -duration 20m
+      - name: Native fuzzing of Parse
+        run: go test ./parser -run '^$' -fuzz FuzzParse -fuzztime 10m

@@ -83,7 +83,7 @@ func (tc *transformContext) transformInsert(n tnode) ast.Stmt {
 	}
 	if oc, ok := n.child(8).opt(); ok {
 		if stmt.OnConflict != nil {
-			raise("OR REPLACE|IGNORE is not compatible with ON CONFLICT")
+			raise("You can not provide both OR REPLACE|IGNORE and an ON CONFLICT clause, please remove the first if you want to have more granular control")
 		}
 		stmt.OnConflict = tc.transformOnConflict(oc)
 	}

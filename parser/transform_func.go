@@ -433,16 +433,17 @@ func (tc *transformContext) transformFrameClause(w *ast.WindowExpression, n tnod
 	case "BetweenFrameExtent":
 		start, startExpr := tc.transformFrameBound(extent.child(1), kind, true)
 		end, endExpr := tc.transformFrameBound(extent.child(3), kind, false)
-		if end == ast.WindowUnboundedPreceding {
-			raise("Frame end cannot be UNBOUNDED PRECEDING")
-		}
 		w.FrameStart, w.StartExpr = start, startExpr
 		w.FrameEnd, w.EndExpr = end, endExpr
 	default:
 		shapeError(extent, "unknown frame extent")
 	}
+	// upstream validates the start bound before the end bound
 	if w.FrameStart == ast.WindowUnboundedFollowing {
 		raise("Frame start cannot be UNBOUNDED FOLLOWING")
+	}
+	if w.FrameEnd == ast.WindowUnboundedPreceding {
+		raise("Frame end cannot be UNBOUNDED PRECEDING")
 	}
 	if excl, ok := n.child(2).opt(); ok {
 		_, e := excl.child(1).sole().choice()
@@ -1004,6 +1005,18 @@ var intervalFuncs = map[string]string{
 	"MillenniumKeyword":  "to_millennia",
 }
 
+// intervalRangeSpecifiers spells the IntervalToInterval alternatives the
+// way upstream's error message does.
+var intervalRangeSpecifiers = map[string]string{
+	"YearToMonth":    "YEAR TO MONTH",
+	"DayToHour":      "DAY TO HOUR",
+	"DayToMinute":    "DAY TO MINUTE",
+	"DayToSecond":    "DAY TO SECOND",
+	"HourToMinute":   "HOUR TO MINUTE",
+	"HourToSecond":   "HOUR TO SECOND",
+	"MinuteToSecond": "MINUTE TO SECOND",
+}
+
 // IntervalLiteral <- 'INTERVAL' IntervalParameter Interval?
 func (tc *transformContext) transformIntervalLiteral(n tnode) ast.Expr {
 	sp := n.span()
@@ -1031,7 +1044,12 @@ func (tc *transformContext) transformIntervalLiteral(n tnode) ast.Expr {
 	}
 	_, unit := unitNode.sole().choice()
 	if unit.name() == "IntervalToInterval" {
-		raise("interval range specifiers (e.g. YEAR TO MONTH) are not supported in interval literals")
+		_, r := unit.sole().choice()
+		spec, ok := intervalRangeSpecifiers[r.name()]
+		if !ok {
+			shapeError(r, "unknown interval range specifier")
+		}
+		raise("%s is not supported", spec)
 	}
 	fname, ok := intervalFuncs[unit.name()]
 	if !ok {

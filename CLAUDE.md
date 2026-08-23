@@ -77,6 +77,10 @@ Two corpus gates run under `go test ./parser`:
   pinned DuckDB binary parses it. Since milestone 3 the classification
   runs the full Parse pipeline, so transformer-raised Parser Errors count
   alongside the matcher's syntax errors.
+- **Error fidelity** (`TestCorpusErrorMessages`, since milestone 6):
+  every rejection renders the oracle's recorded first line verbatim.
+  Positions and messages the corpus can't pin are covered by unit tests
+  in `parser/errors_test.go`.
 - **Tree shape** (`TestSerializeGoldens`): `internal/serialize` output
   must match vendored `json_serialize_sql` goldens for a corpus sample
   (see `parser/testdata/serialize/README.md`).

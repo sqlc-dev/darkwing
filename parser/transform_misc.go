@@ -22,6 +22,7 @@ import (
 	"strings"
 
 	"github.com/sqlc-dev/darkwing/ast"
+	"github.com/sqlc-dev/darkwing/token"
 )
 
 func init() {
@@ -753,6 +754,28 @@ func (tc *transformContext) transformComment(n tnode) ast.Stmt {
 	return stmt
 }
 
+// optionallyQuoted renders an identifier for an error message the way
+// upstream's KeywordHelper::WriteOptionallyQuoted does: wrapped in double
+// quotes (embedded quotes doubled) when it is empty, is a keyword, or is
+// not a plain lowercase identifier.
+func optionallyQuoted(s string) string {
+	needs := s == "" || token.IsKeyword(s)
+	for i := 0; i < len(s) && !needs; i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z' || c == '_':
+		case c >= '0' && c <= '9':
+			needs = i == 0
+		default:
+			needs = true
+		}
+	}
+	if !needs {
+		return s
+	}
+	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+}
+
 // qualifiedNameFromParts splits a dotted path into catalog/schema/name,
 // mirroring upstream's QualifiedName::StringToQualifiedName.
 func qualifiedNameFromParts(parts []string) (catalog, schema, name string) {
@@ -764,7 +787,7 @@ func qualifiedNameFromParts(parts []string) (catalog, schema, name string) {
 	case 3:
 		return parts[0], parts[1], parts[2]
 	}
-	raise("Too many qualifications for name \"%s\"", strings.Join(parts, "."))
+	raise("Too many qualifications found - expected [catalog.schema.name] or [schema.name]")
 	return "", "", ""
 }
 

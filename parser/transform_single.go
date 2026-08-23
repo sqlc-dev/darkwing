@@ -6,10 +6,10 @@ package parser
 
 import (
 	"errors"
+	"fmt"
 	"math"
 	"strconv"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/sqlc-dev/darkwing/ast"
 	"github.com/sqlc-dev/darkwing/internal/matcher"
@@ -191,9 +191,12 @@ func (tc *transformContext) stringConstant(sp ast.Span, s string, kind matcher.S
 		if strings.IndexByte(unescaped, 0) >= 0 {
 			raise("Null character not permitted in escape string literal")
 		}
-		if !utf8.ValidString(unescaped) {
-			raise("Invalid UTF-8 in escape string literal at byte offset %d: invalid unicode codepoint",
-				invalidUTF8Offset(unescaped))
+		if reason, off := analyzeUTF8(unescaped); reason != utf8Valid {
+			kind := "byte mismatch"
+			if reason == utf8InvalidUnicode {
+				kind = "invalid unicode"
+			}
+			raise("Invalid UTF-8 in escape string literal at byte offset %d: %s", off, kind)
 		}
 		return constExpr(sp, varcharValue(unescaped))
 	default:
@@ -250,19 +253,6 @@ func unescapeString(s string) string {
 	return sb.String()
 }
 
-// invalidUTF8Offset finds the first invalid byte offset of a non-UTF-8
-// string (for the escape-literal error message).
-func invalidUTF8Offset(s string) int {
-	for i := 0; i < len(s); {
-		r, size := utf8.DecodeRuneInString(s[i:])
-		if r == utf8.RuneError && size == 1 {
-			return i
-		}
-		i += size
-	}
-	return len(s)
-}
-
 func isHexDigit(c byte) bool {
 	return c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
 }
@@ -306,13 +296,26 @@ func integerTypeFor(v int64) string {
 // INTEGER/BIGINT/HUGEINT (then DOUBLE), plain decimals become DECIMAL
 // with derived width/scale (up to width 38), exponent forms become
 // DOUBLE.
+// unconvertibleNumber stands in for a number literal whose text has no
+// value (e.g. "2.03.0", tokenized as a single number): upstream accepts
+// the token and throws InvalidInputException while constructing the
+// value ("Could not convert string ... to DECIMAL(5,1)") — post-parse
+// under the oracle's classification — so darkwing records the raw text
+// as a cast to the derived type and accepts (found by cmd/difftest).
+func unconvertibleNumber(sp ast.Span, text, typeID string) ast.Expr {
+	child := constExpr(invalidSpan, varcharValue(text))
+	cast := &ast.CastExpression{Child: child, ResolvedType: typeID}
+	cast.SetSpan(sp)
+	return cast
+}
+
 func numberConstant(sp ast.Span, text string) ast.Expr {
 	clean := strings.ReplaceAll(text, "_", "")
 	lower := strings.ToLower(clean)
 	if strings.ContainsAny(lower, "e") {
 		f, err := parseDouble(clean)
 		if err != nil {
-			raise("invalid number literal \"%s\"", text)
+			return unconvertibleNumber(sp, clean, "DOUBLE")
 		}
 		return constExpr(sp, ast.Value{Type: ast.LogicalType{ID: "DOUBLE"}, Kind: ast.ValueDouble, Float64: f})
 	}
@@ -331,7 +334,7 @@ func numberConstant(sp ast.Span, text string) ast.Expr {
 	}
 	f, err := parseDouble(clean)
 	if err != nil {
-		raise("invalid number literal \"%s\"", text)
+		return unconvertibleNumber(sp, clean, "DOUBLE")
 	}
 	return constExpr(sp, ast.Value{Type: ast.LogicalType{ID: "DOUBLE"}, Kind: ast.ValueDouble, Float64: f})
 }
@@ -362,7 +365,7 @@ func decimalConstant(sp ast.Span, clean string, dot int) ast.Expr {
 	if width > 38 {
 		f, err := parseDouble(clean)
 		if err != nil {
-			raise("invalid number literal \"%s\"", clean)
+			return unconvertibleNumber(sp, clean, "DOUBLE")
 		}
 		return constExpr(sp, ast.Value{Type: ast.LogicalType{ID: "DOUBLE"}, Kind: ast.ValueDouble, Float64: f})
 	}
@@ -376,7 +379,7 @@ func decimalConstant(sp ast.Span, clean string, dot int) ast.Expr {
 	}
 	h, ok := parseHugeint(unscaled)
 	if !ok {
-		raise("invalid number literal \"%s\"", clean)
+		return unconvertibleNumber(sp, clean, fmt.Sprintf("DECIMAL(%d,%d)", width, scale))
 	}
 	return constExpr(sp, ast.Value{Type: typ, Kind: ast.ValueHugeint, Hugeint: h})
 }

@@ -17,7 +17,10 @@ type SyntaxError struct {
 }
 
 func (e *SyntaxError) Error() string {
-	return fmt.Sprintf("syntax error at or near %q", e.Token.Text)
+	// the token's raw spelling goes between plain double quotes with no
+	// escaping, exactly as upstream renders it (embedded quotes,
+	// backslashes and newlines stay verbatim)
+	return `syntax error at or near "` + e.Token.Text + `"`
 }
 
 // MatchError is a non-positional matching error, mirroring the

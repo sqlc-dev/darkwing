@@ -20,28 +20,34 @@ loader, and matcher (with packrat memoization) — to Go.
 
 ## Status
 
-Milestone 2 (corpus + accept/reject conformance) is in place: the corpus
-under `parser/testdata/` is extracted from DuckDB's own test suite and
-classified by the pinned DuckDB CLI (`cmd/regenerate`); `go test ./parser`
-enforces *darkwing accepts iff pinned DuckDB parses*, with remaining
-disagreements tracked in todo metadata (`cmd/next-test`).
+Milestones 1–6 are complete: the engine (tokenizer, grammar loader,
+matcher with packrat memoization), the corpus conformance gates, the full
+typed AST with a transformer for every statement, and the hardening pass.
+`go test ./parser` enforces, corpus-wide against the pinned DuckDB CLI:
 
-Milestone 1 (engine) is complete:
+- **Accept/reject** — darkwing accepts a statement iff the pinned binary
+  parses it (`TestCorpus`), including transformer-raised parser errors.
+- **Error fidelity** — every rejection renders the oracle's error message
+  verbatim (`TestCorpusErrorMessages`), with positions pinned by unit
+  tests.
+- **Tree shape** — `internal/serialize` output matches vendored
+  `json_serialize_sql` goldens for the SELECT subset
+  (`TestSerializeGoldens`), with AST snapshots covering the rest.
 
-- `token/` — token kinds and DuckDB's keyword categories
-- `lexer/` — port of the parsing tokenizer
-- `internal/grammar/` — vendored grammar (pinned upstream commit recorded in
-  `internal/grammar/README.md`) and the grammar loader
-- `internal/matcher/` — matcher tree, packrat memoization, rule overrides,
-  furthest-failure error reporting
-- `cmd/debug-parse` — dump tokens or the raw parse tree for SQL on the
-  command line
+Hardening: `FuzzParse` holds the public API to its invariants on
+arbitrary input, benchmarks pin parse throughput and upstream's
+pathological-backtracking case (19 unmatched parens: milliseconds, thanks
+to packrat), and `cmd/difftest` mutates corpus seeds and diffs darkwing's
+verdicts against the pinned CLI (run nightly in CI while the nightly
+artifact matches the pin).
 
-Next: the typed AST and transformer core (milestone 3).
+Next: advancing the pin to the v2.0.0 tag when it lands (milestone 7),
+then sqlc integration.
 
 ```
 $ go run ./cmd/debug-parse 'SELECT 1'
 $ go run ./cmd/debug-parse -tokens 'SELECT * FROM t'
+$ go run ./cmd/debug-parse -ast 'FROM t SELECT x'
 ```
 
 ## License

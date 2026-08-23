@@ -67,6 +67,9 @@ func ParseExpr(ctx context.Context, sql string) (expr ast.Expr, err error) {
 	if err != nil {
 		return nil, err
 	}
+	if ue := validateQueryUTF8(sql); ue != nil {
+		return nil, ue
+	}
 	tokens, err := lexer.Tokenize(sql)
 	if err != nil {
 		return nil, newError(sql, err)
@@ -91,6 +94,10 @@ func parseString(ctx context.Context, src string) (stmts []ast.Stmt, err error) 
 	engine, err := matcher.Default()
 	if err != nil {
 		return nil, err
+	}
+	// the pinned build validates the whole query's UTF-8 before parsing
+	if ue := validateQueryUTF8(src); ue != nil {
+		return nil, ue
 	}
 	tokens, err := lexer.Tokenize(src)
 	if err != nil {
@@ -204,6 +211,12 @@ func newError(src string, err error) error {
 	default:
 		msg = err.Error()
 	}
+	return errorAt(src, msg, offset)
+}
+
+// errorAt builds an *Error at a byte offset in src, deriving line and
+// column (offset -1 means no position).
+func errorAt(src, msg string, offset int) *Error {
 	pe := &Error{Msg: msg, Offset: offset, Line: 1, Column: 1}
 	if offset >= 0 {
 		line, col := 1, 1

@@ -9,7 +9,6 @@ import (
 	"math"
 	"strconv"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/sqlc-dev/darkwing/ast"
 	"github.com/sqlc-dev/darkwing/internal/matcher"
@@ -191,9 +190,12 @@ func (tc *transformContext) stringConstant(sp ast.Span, s string, kind matcher.S
 		if strings.IndexByte(unescaped, 0) >= 0 {
 			raise("Null character not permitted in escape string literal")
 		}
-		if !utf8.ValidString(unescaped) {
-			raise("Invalid UTF-8 in escape string literal at byte offset %d: invalid unicode codepoint",
-				invalidUTF8Offset(unescaped))
+		if reason, off := analyzeUTF8(unescaped); reason != utf8Valid {
+			kind := "byte mismatch"
+			if reason == utf8InvalidUnicode {
+				kind = "invalid unicode"
+			}
+			raise("Invalid UTF-8 in escape string literal at byte offset %d: %s", off, kind)
 		}
 		return constExpr(sp, varcharValue(unescaped))
 	default:
@@ -248,19 +250,6 @@ func unescapeString(s string) string {
 		}
 	}
 	return sb.String()
-}
-
-// invalidUTF8Offset finds the first invalid byte offset of a non-UTF-8
-// string (for the escape-literal error message).
-func invalidUTF8Offset(s string) int {
-	for i := 0; i < len(s); {
-		r, size := utf8.DecodeRuneInString(s[i:])
-		if r == utf8.RuneError && size == 1 {
-			return i
-		}
-		i += size
-	}
-	return len(s)
 }
 
 func isHexDigit(c byte) bool {

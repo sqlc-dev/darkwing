@@ -68,7 +68,7 @@ func (tc *transformContext) transformCreate(n tnode) ast.Stmt {
 	base.Temporary = temporary
 	if base.OnConflict == "" || onConflict == ast.CreateReplace {
 		if base.OnConflict == ast.CreateIgnore && onConflict == ast.CreateReplace {
-			raise("cannot combine OR REPLACE with IF NOT EXISTS")
+			raise("Cannot specify both OR REPLACE and IF NOT EXISTS within single create statement")
 		}
 		if onConflict != ast.CreateError || base.OnConflict == "" {
 			if base.OnConflict == "" {
@@ -114,7 +114,7 @@ func (tc *transformContext) transformCreateTable(n tnode) ast.CreateInfo {
 		stmt := tc.transformStatement(def.child(4))
 		sel, ok := stmt.(*ast.SelectStatement)
 		if !ok {
-			raise("CREATE TABLE AS requires a SELECT statement")
+			raise("CREATE TABLE AS requires a SELECT clause")
 		}
 		info.Query = sel
 	case "CreateColumnList":
@@ -164,7 +164,7 @@ func (tc *transformContext) transformColumnDefinition(n tnode) ast.ColumnDef {
 		}
 	}
 	if col.Type == nil && col.Generated == "" {
-		raise("Column %s must have a type or be defined as a GENERATED column.", strings.Join(col.Names, "."))
+		raise("Column %s must have a type or be defined as a GENERATED column.", optionallyQuoted(strings.Join(col.Names, ".")))
 	}
 	if col.Generated != "" {
 		name := col.Names[len(col.Names)-1]
@@ -926,16 +926,21 @@ func (tc *transformContext) transformAlterTableOption(n tnode) ast.AlterInfo {
 		info := &ast.GenericAlterInfo{Kind: "RESET_OPTIONS"}
 		info.SetSpan(alt.span())
 		// RESET (...) options cannot carry values (a bare NULL passes,
-		// mirroring upstream's null-constant default)
+		// mirroring upstream's null-constant default); upstream checks
+		// the whole list and names the last offending option
+		offender := ""
 		for _, o := range alt.child(1).parens().listElems() {
 			// RelOption <- RelOptionName RelOptionArgumentOpt?
 			if arg, ok := o.child(1).opt(); ok {
 				// RelOptionArgumentOpt <- '=' DefArg
 				_, def := arg.child(1).sole().choice()
 				if def.name() != "DefArgNull" {
-					raise("Reset option \"%s\" cannot set any value. Did you mean to use SET?", relOptionName(o.child(0)))
+					offender = relOptionName(o.child(0))
 				}
 			}
+		}
+		if offender != "" {
+			raise("Reset option \"%s\" cannot set any value. Did you mean to use SET?", offender)
 		}
 		return info
 	}

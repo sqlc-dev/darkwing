@@ -229,8 +229,13 @@ func (tc *transformContext) transformComparison(n tnode) ast.Expr {
 		return expr
 	}
 	if len(tails) > 1 {
-		// upstream bans chained comparisons in the transformer
-		raise("Chained comparisons (e.g. a < b < c) are not supported")
+		// upstream bans chained comparisons in the transformer, but only
+		// after transforming the operands - a deeper operand error (e.g.
+		// an empty subscript) takes precedence over the chain ban
+		for _, tail := range tails {
+			tc.transformBetweenInLike(tail.child(2))
+		}
+		raise("Chained comparisons are not supported, use AND to combine comparisons")
 	}
 	tail := tails[0]
 	_, opAlt := tail.child(0).sole().choice()
@@ -954,7 +959,7 @@ func (tc *transformContext) transformSlice(base ast.Expr, n tnode) ast.Expr {
 	endBound, hasEnd := bound.child(1).opt()
 	if !hasEnd {
 		if start == nil {
-			raise("empty subscript is not allowed")
+			raise("Empty subscript '[]' is not allowed")
 		}
 		return opExpr(sp, ast.ArrayExtract, base, start)
 	}

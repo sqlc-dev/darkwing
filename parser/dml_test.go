@@ -97,7 +97,7 @@ func TestInsertOnConflict(t *testing.T) {
 	if ins.OnConflict == nil || ins.OnConflict.Action != ast.OnConflictReplace {
 		t.Errorf("OR REPLACE on-conflict = %#v", ins.OnConflict)
 	}
-	if msg := parseErr(t, "INSERT OR REPLACE INTO t VALUES (1) ON CONFLICT DO NOTHING"); !strings.Contains(msg, "not compatible") {
+	if msg := parseErr(t, "INSERT OR REPLACE INTO t VALUES (1) ON CONFLICT DO NOTHING"); !strings.Contains(msg, "can not provide both OR REPLACE|IGNORE") {
 		t.Errorf("shorthand+clause error = %q", msg)
 	}
 }

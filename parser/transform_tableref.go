@@ -511,8 +511,8 @@ func (tc *transformContext) transformNearestJoin(left ast.TableRef, n tnode) ast
 	}
 	if num, ok := alt.child(5).opt(); ok {
 		v, err := strconv.ParseInt(num.number(), 10, 64)
-		if err != nil {
-			raise("invalid NEAREST count")
+		if err != nil || v <= 0 {
+			raise("NEAREST expects a positive integer literal, got \"%s\"", num.number())
 		}
 		join.NearestCount = v
 	}
@@ -795,7 +795,7 @@ func (tc *transformContext) transformPivotStatement(n tnode) ast.QueryNode {
 					raise("Cannot pivot on constant value \"%s\"", constantText(e))
 				}
 				if hasSubquery(e) {
-					raise("Cannot pivot on subquery \"%s\"", constantText(e))
+					raise("Cannot pivot on subquery \"%s\"", tc.exprSourceText(e))
 				}
 			}
 		}
@@ -896,6 +896,18 @@ func constantText(e ast.Expr) string {
 		return "false"
 	}
 	return "?"
+}
+
+// exprSourceText renders an expression for an error message by slicing
+// the original source at its span — a best-effort stand-in for upstream's
+// ToString renderer, which darkwing does not have. Falls back to
+// constantText when the span is invalid.
+func (tc *transformContext) exprSourceText(e ast.Expr) string {
+	start, end := e.Pos(), e.End()
+	if start >= 0 && start < end && end <= len(tc.src) {
+		return tc.src[start:end]
+	}
+	return constantText(e)
 }
 
 // PivotColumnEntry <- PivotColumnSubquery / PivotValueList / PivotColumnExpression

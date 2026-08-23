@@ -64,6 +64,15 @@ type DeleteQueryNode struct {
 
 func (n *DeleteQueryNode) Children() []Node { return add(n.baseChildren(), n.Delete) }
 
+// CopyQueryNode wraps a COPY ... TO used as a CTE body (upstream's
+// COPY_QUERY_NODE, new in DuckDB 2.0).
+type CopyQueryNode struct {
+	queryNodeBase
+	Copy *CopyInfo `json:"copy"`
+}
+
+func (n *CopyQueryNode) Children() []Node { return add(n.baseChildren(), n.Copy) }
+
 // queryNodeBase carries what every DuckDB QueryNode has: result modifiers
 // and a CTE map.
 type queryNodeBase struct {

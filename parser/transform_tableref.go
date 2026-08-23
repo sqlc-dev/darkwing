@@ -291,6 +291,13 @@ func (tc *transformContext) transformValuesClause(n tnode) *ast.ExpressionListRe
 	for _, row := range n.child(1).listElems() {
 		ref.Values = append(ref.Values, tc.transformExpressionList(row.sole().parens()))
 	}
+	for _, row := range ref.Values[1:] {
+		if len(row) != len(ref.Values[0]) {
+			raise("VALUES lists must all be the same length, expected %d %s but found a list with %d %s",
+				len(ref.Values[0]), plural(len(ref.Values[0]), "entry", "entries"),
+				len(row), plural(len(row), "entry", "entries"))
+		}
+	}
 	return ref
 }
 
@@ -320,25 +327,7 @@ func (tc *transformContext) transformTableFunction(n tnode) ast.TableRef {
 	if _, ok := ordinality.opt(); ok {
 		ref.WithOrdinality = true
 	}
-	// QualifiedTableFunction <- CatalogQualification? SchemaQualification? TableFunctionName
-	fn := &ast.FunctionExpression{}
-	fn.SetSpan(invalidSpan)
-	if cq, ok := qualified.child(0).opt(); ok {
-		fn.Catalog = identifierText(cq.child(0))
-	}
-	if sq, ok := qualified.child(1).opt(); ok {
-		fn.Schema = identifierText(sq.child(0))
-	}
-	if fn.Catalog != "" && fn.Schema == "" {
-		fn.Catalog, fn.Schema = "", fn.Catalog
-	}
-	fn.FunctionName = strings.ToLower(identifierText(qualified.child(2)))
-	// TableFunctionArguments <- Parens(List(FunctionArgument)?)
-	if list, ok := args.sole().parens().opt(); ok {
-		for _, a := range list.listElems() {
-			fn.Arguments = append(fn.Arguments, tc.transformFunctionArgument(a))
-		}
-	}
+	fn := tc.qualifiedFunctionExpr(qualified, args)
 	// values(...) is a VALUES list, wrapped like any FROM-position VALUES
 	if fn.FunctionName == "values" && fn.Schema == "" && fn.Catalog == "" {
 		el := &ast.ExpressionListRef{}
@@ -356,6 +345,31 @@ func (tc *transformContext) transformTableFunction(n tnode) ast.TableRef {
 	}
 	ref.Function = fn
 	return ref
+}
+
+// qualifiedFunctionExpr builds the call expression for a qualified table
+// function plus its argument list (shared by table functions and CALL).
+// QualifiedTableFunction <- CatalogQualification? SchemaQualification? TableFunctionName
+// TableFunctionArguments <- Parens(List(FunctionArgument)?)
+func (tc *transformContext) qualifiedFunctionExpr(qualified, args tnode) *ast.FunctionExpression {
+	fn := &ast.FunctionExpression{}
+	fn.SetSpan(invalidSpan)
+	if cq, ok := qualified.child(0).opt(); ok {
+		fn.Catalog = identifierText(cq.child(0))
+	}
+	if sq, ok := qualified.child(1).opt(); ok {
+		fn.Schema = identifierText(sq.child(0))
+	}
+	if fn.Catalog != "" && fn.Schema == "" {
+		fn.Catalog, fn.Schema = "", fn.Catalog
+	}
+	fn.FunctionName = strings.ToLower(identifierText(qualified.child(2)))
+	if list, ok := args.sole().parens().opt(); ok {
+		for _, a := range list.listElems() {
+			fn.Arguments = append(fn.Arguments, tc.transformFunctionArgument(a))
+		}
+	}
+	return fn
 }
 
 // ---- joins -------------------------------------------------------------
@@ -487,6 +501,9 @@ func (tc *transformContext) transformNearestJoin(left ast.TableRef, n tnode) ast
 	join.RefType = ast.JoinRefNearest
 	if jt, ok := alt.child(0).opt(); ok {
 		join.JoinType = joinTypeOf(jt)
+	}
+	if join.JoinType != ast.JoinInner && join.JoinType != ast.JoinLeft {
+		raise("NEAREST BY only supports INNER and LEFT OUTER joins, not %s", string(join.JoinType))
 	}
 	if ae, ok := alt.child(3).opt(); ok {
 		_, kind := ae.sole().choice()
@@ -732,6 +749,9 @@ func (tc *transformContext) transformTableUnpivot(left ast.TableRef, n tnode) as
 		// UnpivotValueList <- UnpivotHeader 'IN' UnpivotTargetList
 		var col ast.PivotColumn
 		col.UnpivotNames = tc.transformUnpivotHeader(uv.child(0))
+		if len(col.UnpivotNames) != 1 {
+			raise("UNPIVOT requires a single column name for the PIVOT IN clause")
+		}
 		// UnpivotTargetList <- Parens(TargetList)
 		for _, e := range uv.child(2).parens().listElems() {
 			col.Entries = append(col.Entries, tc.unpivotEntry(e))
@@ -767,6 +787,32 @@ func (tc *transformContext) transformPivotStatement(n tnode) ast.QueryNode {
 		// PivotOn <- 'ON' PivotColumnList
 		for _, e := range on.child(1).sole().listElems() {
 			ref.Pivots = append(ref.Pivots, tc.transformPivotColumnEntry(e))
+		}
+		// port of TransformPivotColumnList's checks on the ON expressions
+		for _, col := range ref.Pivots {
+			for _, e := range col.PivotExpressions {
+				if isScalarExpr(e) {
+					raise("Cannot pivot on constant value \"%s\"", constantText(e))
+				}
+				if hasSubquery(e) {
+					raise("Cannot pivot on subquery \"%s\"", constantText(e))
+				}
+			}
+		}
+		// pivot columns without an IN list or enum extract their values
+		// from the data; upstream records them as pivot entries (enum
+		// expansion), darkwing counts them for the CREATE VIEW/MACRO
+		// check. Parameters seen before this point (the pivot source) mix
+		// with data extraction and are rejected at the statement level;
+		// parameters later in the statement (USING aggregates) are fine,
+		// matching upstream's transform order.
+		for _, col := range ref.Pivots {
+			if col.PivotEnum == "" && len(col.Entries) == 0 && len(col.PivotExpressions) > 0 {
+				tc.pivotEntries++
+				if tc.paramCount > 0 || tc.hasNamed || tc.hasPosition {
+					tc.pivotEntryHasParams = true
+				}
+			}
 		}
 	}
 	if using, ok := n.child(3).opt(); ok {
@@ -807,6 +853,49 @@ func (tc *transformContext) transformPivotStatement(n tnode) ast.QueryNode {
 		return node
 	}
 	return starSelect(ref, n.span())
+}
+
+// isScalarExpr ports ParsedExpression::IsScalar: true when the tree
+// contains no column/positional references, defaults or subqueries
+// (parameters count as scalar upstream).
+func isScalarExpr(e ast.Expr) bool {
+	switch e.(type) {
+	case nil:
+		return true
+	case *ast.ColumnRefExpression, *ast.DefaultExpression,
+		*ast.PositionalReferenceExpression, *ast.SubqueryExpression:
+		return false
+	}
+	for _, child := range e.Children() {
+		if expr, ok := child.(ast.Expr); ok && !isScalarExpr(expr) {
+			return false
+		}
+	}
+	return true
+}
+
+// constantText renders an expression for an error message, best-effort
+// (upstream calls the full ToString renderer, which darkwing does not
+// have; only constants are spelled out).
+func constantText(e ast.Expr) string {
+	c, ok := e.(*ast.ConstantExpression)
+	if !ok {
+		return "?"
+	}
+	switch {
+	case c.Value.IsNull:
+		return "NULL"
+	case c.Value.Kind == ast.ValueString:
+		return "'" + c.Value.Str + "'"
+	case c.Value.Kind == ast.ValueInt64:
+		return strconv.FormatInt(c.Value.Int64, 10)
+	case c.Value.Kind == ast.ValueBool:
+		if c.Value.Bool {
+			return "true"
+		}
+		return "false"
+	}
+	return "?"
 }
 
 // PivotColumnEntry <- PivotColumnSubquery / PivotValueList / PivotColumnExpression

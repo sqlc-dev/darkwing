@@ -56,16 +56,31 @@ func (tc *transformContext) transformFunction(n tnode) ast.Expr {
 	parts := tc.transformFunctionArgumentList(n.child(1).sole().parens())
 	starCallRewrite(&parts)
 	if wg, ok := n.child(2).opt(); ok {
-		// WITHIN GROUP (ORDER BY ...): the ordering becomes the
-		// function's ORDER BY, and the percentile functions are renamed
-		// to their quantile implementations
+		// WITHIN GROUP (ORDER BY ...): the ordering replaces the
+		// function's ORDER BY, and only the ordered-set aggregates are
+		// accepted (renamed to their quantile implementations)
 		orderBy := wg.child(2).parens()
-		parts.orderBys = append(parts.orderBys, tc.transformOrderByClause(orderBy)...)
+		parts.orderBys = tc.transformOrderByClause(orderBy)
+		if len(parts.orderBys) != 1 {
+			raise("Cannot use multiple ORDER BY clauses with WITHIN GROUP")
+		}
 		switch name {
 		case "percentile_cont":
+			if len(parts.args) != 1 {
+				raise("Wrong number of arguments for PERCENTILE_CONT")
+			}
 			name = "quantile_cont"
 		case "percentile_disc":
+			if len(parts.args) != 1 {
+				raise("Wrong number of arguments for PERCENTILE_DISC")
+			}
 			name = "quantile_disc"
+		case "mode":
+			if len(parts.args) != 0 {
+				raise("Wrong number of arguments for MODE")
+			}
+		default:
+			raise("Unknown ordered aggregate \"%s\".", name)
 		}
 	}
 	var filter ast.Expr
@@ -77,6 +92,9 @@ func (tc *transformContext) transformFunction(n tnode) ast.Expr {
 	_, exportState := n.child(4).opt()
 
 	if over, ok := n.child(5).opt(); ok {
+		if exportState {
+			raise("EXPORT_STATE is not supported for window functions!")
+		}
 		return tc.transformOver(over, catalog, schema, name, parts, filter, n.span())
 	}
 	if parts.hasNullsOpt {
@@ -236,6 +254,9 @@ func (tc *transformContext) transformFunctionArgument(n tnode) ast.FunctionArgum
 // transformOver builds the WindowExpression for a call with an OVER
 // clause.
 func (tc *transformContext) transformOver(n tnode, catalog, schema, name string, parts functionParts, filter ast.Expr, sp ast.Span) ast.Expr {
+	if tc.inWindowDefinition {
+		raise("window functions are not allowed in window definitions")
+	}
 	w := &ast.WindowExpression{
 		Catalog:        catalog,
 		Schema:         schema,
@@ -267,11 +288,17 @@ func (tc *transformContext) transformOver(n tnode, catalog, schema, name string,
 	_, frame := n.child(1).sole().choice()
 	switch frame.name() {
 	case "ParensIdentifier":
-		tc.applyNamedWindow(w, identifierText(frame.sole().parens()))
+		name := identifierText(frame.sole().parens())
+		tc.applyNamedWindow(w, name)
+		if windowHasFrameClause(w) {
+			raise("cannot copy window \"%s\" because it has a frame clause", name)
+		}
 	case "IdentifierWindowFrame":
 		tc.applyNamedWindow(w, identifierText(frame.sole()))
 	case "WindowFrameDefinition":
+		tc.inWindowDefinition = true
 		tc.transformWindowFrameDefinition(w, frame)
+		tc.inWindowDefinition = false
 	default:
 		shapeError(frame, "unknown window frame")
 	}
@@ -302,25 +329,77 @@ func copyWindowSpec(dst, src *ast.WindowExpression) {
 func (tc *transformContext) transformWindowFrameDefinition(w *ast.WindowExpression, n tnode) {
 	_, alt := n.sole().choice()
 	var contents tnode
+	var baseName tnode
+	hasBase := false
 	switch alt.name() {
 	case "WindowFrameNameContentsParens":
 		inner := alt.sole().parens()
 		// WindowFrameNameContents <- BaseWindowName? WindowFrameContents
-		if baseName, ok := inner.child(0).opt(); ok {
-			tc.applyNamedWindow(w, identifierText(baseName))
-		}
+		baseName, hasBase = inner.child(0).opt()
 		contents = inner.child(1)
 	case "WindowFrameContentsParens":
 		contents = alt.sole().parens()
 	default:
 		shapeError(alt, "unknown window frame definition")
 	}
-	// WindowFrameContents <- WindowPartition? OrderByClause? FrameClause?
+	if !hasBase {
+		tc.fillWindowContents(w, contents)
+		return
+	}
+	// OVER (base ...) extends a named window; upstream forbids copying a
+	// window with a frame clause and overriding its ORDER/PARTITION BY
+	name := identifierText(baseName)
+	switch strings.ToLower(name) {
+	case "partition", "range", "rows", "groups":
+		raise("Invalid window name \"%s\"", name)
+	}
+	tc.applyNamedWindow(w, name)
+	if windowHasFrameClause(w) {
+		raise("cannot copy window \"%s\" because it has a frame clause", name)
+	}
+	over := &ast.WindowExpression{
+		FrameStart: ast.WindowUnboundedPreceding, FrameEnd: ast.WindowCurrentRowRange,
+		ExcludeClause: ast.WindowExcludeNoOther,
+	}
+	tc.fillWindowContents(over, contents)
+	w.FrameStart, w.FrameEnd = over.FrameStart, over.FrameEnd
+	w.StartExpr, w.EndExpr = over.StartExpr, over.EndExpr
+	w.ExcludeClause = over.ExcludeClause
+	if len(w.Orders) > 0 && len(over.Orders) > 0 {
+		raise("Cannot override ORDER BY clause of window \"%s\"", name)
+	}
+	if len(w.Orders) == 0 {
+		w.Orders = over.Orders
+	}
+	if len(w.Partitions) > 0 && len(over.Partitions) > 0 {
+		raise("Cannot override PARTITION BY clause of window \"%s\"", name)
+	}
+	if len(w.Partitions) == 0 {
+		w.Partitions = over.Partitions
+	}
+}
+
+// windowHasFrameClause ports IsWindowFrameDefault's negation plus the
+// explicit bound expressions.
+func windowHasFrameClause(w *ast.WindowExpression) bool {
+	return w.StartExpr != nil || w.EndExpr != nil ||
+		w.FrameStart != ast.WindowUnboundedPreceding || w.FrameEnd != ast.WindowCurrentRowRange
+}
+
+// fillWindowContents maps WindowFrameContents
+// (WindowPartition? OrderByClause? FrameClause?).
+func (tc *transformContext) fillWindowContents(w *ast.WindowExpression, contents tnode) {
 	if part, ok := contents.child(0).opt(); ok {
 		w.Partitions = tc.transformExpressionList(part.child(2))
 	}
 	if ob, ok := contents.child(1).opt(); ok {
-		w.Orders = append(w.Orders, tc.transformOrderByClause(ob)...)
+		orders := tc.transformOrderByClause(ob)
+		for _, o := range orders {
+			if star, isStar := o.Expression.(*ast.StarExpression); isStar && star.Expr == nil {
+				raise("Cannot ORDER BY ALL in a window expression")
+			}
+		}
+		w.Orders = append(w.Orders, orders...)
 	}
 	if fc, ok := contents.child(2).opt(); ok {
 		tc.transformFrameClause(w, fc)
@@ -354,10 +433,16 @@ func (tc *transformContext) transformFrameClause(w *ast.WindowExpression, n tnod
 	case "BetweenFrameExtent":
 		start, startExpr := tc.transformFrameBound(extent.child(1), kind, true)
 		end, endExpr := tc.transformFrameBound(extent.child(3), kind, false)
+		if end == ast.WindowUnboundedPreceding {
+			raise("Frame end cannot be UNBOUNDED PRECEDING")
+		}
 		w.FrameStart, w.StartExpr = start, startExpr
 		w.FrameEnd, w.EndExpr = end, endExpr
 	default:
 		shapeError(extent, "unknown frame extent")
+	}
+	if w.FrameStart == ast.WindowUnboundedFollowing {
+		raise("Frame start cannot be UNBOUNDED FOLLOWING")
 	}
 	if excl, ok := n.child(2).opt(); ok {
 		_, e := excl.child(1).sole().choice()

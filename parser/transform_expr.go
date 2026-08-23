@@ -845,7 +845,16 @@ func (tc *transformContext) transformBase(n tnode) ast.Expr {
 	bare := singleAlt.name() == "ColumnReference"
 	if indirections, ok := n.child(1).opt(); ok {
 		items := indirections.sole().repeat()
+		prevWasCast := false
 		for i, ind := range items {
+			// upstream rejects an operator-class indirection (subscript /
+			// slice) directly after a `::` cast
+			_, kind := ind.sole().choice()
+			if kind.name() == "SliceExpression" && prevWasCast {
+				raise("Subscript/slice cannot be applied directly after a cast operator " +
+					"(e.g. x::TYPE[1:3] is not allowed). Wrap the cast in parentheses: (x::TYPE)[1:3]")
+			}
+			prevWasCast = kind.name() == "CastOperator"
 			expr, bare = tc.transformIndirection(expr, ind, n.span().Start, bare, i == len(items)-1)
 		}
 	}

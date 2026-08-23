@@ -32,20 +32,10 @@ func (e *Error) Error() string {
 	return "Parser Error: " + e.Msg
 }
 
-// ErrUnsupported marks statements the transformer does not cover yet
-// (milestone 5 territory: COPY, SET, PRAGMA, ...). The engine accepted
-// the statement; only the AST is missing.
+// ErrUnsupported marked statements the transformer did not cover yet.
+// Since milestone 5 every statement has a transformer and Parse no longer
+// returns it; the variable stays for API compatibility.
 var ErrUnsupported = errors.New("darkwing: statement not supported yet")
-
-type unsupportedError struct {
-	rule string
-}
-
-func (e *unsupportedError) Error() string {
-	return fmt.Sprintf("darkwing: statement not supported yet (%s)", e.rule)
-}
-
-func (e *unsupportedError) Unwrap() error { return ErrUnsupported }
 
 // Parse reads SQL from r and returns its statements. Statement spans tile
 // the input: statement i covers [prev end, own end), the first starts at
@@ -133,6 +123,13 @@ func parseString(ctx context.Context, src string) (stmts []ast.Stmt, err error) 
 		if stmt == nil {
 			continue
 		}
+		// port of CreatePivotStatement's parameter check: data-extracted
+		// pivot values cannot mix with prepared parameters
+		if tc.pivotEntries > 0 && tc.pivotEntryHasParams {
+			raise("PIVOT statements with pivot elements extracted from the data cannot have parameters in their source.\n" +
+				"In order to use parameters the PIVOT values must be manually specified, e.g.:\n" +
+				"PIVOT ... ON ... IN (val1, val2, ...)")
+		}
 		setStmtSpan(stmt, ast.Span{Start: prevEnd, End: end})
 		tc.finishStatement(stmt)
 		stmts = append(stmts, stmt)
@@ -185,8 +182,6 @@ func catchInternal(err *error) {
 			*err = e
 		case *Error:
 			*err = e
-		case *internalErrorUnsupported:
-			*err = &unsupportedError{rule: e.rule}
 		default:
 			panic(r)
 		}

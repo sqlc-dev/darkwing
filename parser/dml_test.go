@@ -198,8 +198,13 @@ func TestDMLParameters(t *testing.T) {
 	if !reflect.DeepEqual(ins.NamedParams, want) {
 		t.Errorf("params = %+v, want %+v", ins.NamedParams, want)
 	}
-	if msg := parseErr(t, "UPDATE t SET a = $x WHERE b = ?"); !strings.Contains(msg, "Mixing named and positional") {
-		t.Errorf("mixed params error = %q", msg)
+	// mixing named and positional parameters is a NotImplemented error
+	// upstream (post-parse for the oracle), so darkwing accepts and keeps
+	// numbering
+	upd := parseOne(t, "UPDATE t SET a = $x WHERE b = ?").(*ast.UpdateStatement)
+	want = []ast.NamedParam{{Name: "x", Index: 1}, {Name: "2", Index: 2}}
+	if !reflect.DeepEqual(upd.NamedParams, want) {
+		t.Errorf("mixed params = %+v, want %+v", upd.NamedParams, want)
 	}
 }
 

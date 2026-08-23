@@ -54,8 +54,14 @@ func (tc *transformContext) transformSelectInternal(n tnode) ast.QueryNode {
 func (tc *transformContext) transformWithClause(n tnode) ast.CTEMap {
 	_, recursive := n.child(1).opt()
 	var out ast.CTEMap
+	seen := map[string]bool{}
 	for _, ws := range n.child(2).listElems() {
 		name, cte := tc.transformWithStatement(ws, recursive)
+		key := strings.ToLower(name)
+		if seen[key] {
+			raise("Duplicate CTE name \"%s\"", name)
+		}
+		seen[key] = true
 		out.Entries = append(out.Entries, ast.CTEMapEntry{Name: name, CTE: cte})
 	}
 	return out
@@ -94,18 +100,47 @@ func (tc *transformContext) transformWithStatement(n tnode, recursive bool) (str
 		shapeError(body, "unknown CTE body")
 	}
 	if recursive {
-		if setop, ok := cte.Query.(*ast.SetOperationNode); ok && setop.SetOpType == ast.SetOpUnion && len(setop.Inputs) == 2 {
+		// port of ValidateRecursiveCTEQueryNode
+		switch cte.Query.(type) {
+		case *ast.CopyQueryNode:
+			raise("Recursive CTEs with COPY statements are not supported")
+		case *ast.InsertQueryNode, *ast.UpdateQueryNode, *ast.DeleteQueryNode:
+			raise("Recursive CTEs with DML statements are not supported")
+		}
+		if setop, ok := cte.Query.(*ast.SetOperationNode); ok && setop.SetOpType == ast.SetOpUnion && len(setop.Inputs) >= 2 {
+			// port of ToRecursiveCTE: modifiers on the union are invalid
+			// (upstream checks the LIMIT and ORDER modifier types only, so
+			// LIMIT n% passes — an upstream quirk kept as-is)
+			for _, m := range setop.Modifiers {
+				switch mod := m.(type) {
+				case *ast.LimitModifier:
+					if mod.LimitType != ast.LimitPercentage {
+						raise("LIMIT or OFFSET in a recursive query is not allowed")
+					}
+				case *ast.OrderModifier:
+					raise("ORDER BY in a recursive query is not allowed")
+				}
+			}
 			rec := &ast.RecursiveCTENode{
 				CTEName:    name,
 				UnionAll:   setop.SetOpAll,
-				Left:       setop.Inputs[0],
-				Right:      setop.Inputs[1],
 				Aliases:    cte.Aliases,
 				KeyTargets: cte.KeyTargets,
 			}
-			rec.Modifiers = setop.Modifiers
 			rec.CTEs = setop.CTEs
+			setop.CTEs = ast.CTEMap{}
 			rec.SetSpan(ast.Span{Start: setop.Pos(), End: setop.End()})
+			if len(setop.Inputs) == 2 {
+				// the union's own (surviving) modifiers are dropped, like
+				// upstream's binary case
+				rec.Left, rec.Right = setop.Inputs[0], setop.Inputs[1]
+			} else {
+				// n-ary flattened union: right = last input, left = the
+				// rest (keeping its modifiers)
+				rec.Right = setop.Inputs[len(setop.Inputs)-1]
+				setop.Inputs = setop.Inputs[:len(setop.Inputs)-1]
+				rec.Left = setop
+			}
 			cte.Query = rec
 		}
 	}
@@ -140,6 +175,13 @@ func dmlQueryNode(stmt ast.Stmt) ast.QueryNode {
 		del := &ast.DeleteStatement{Table: s.Table}
 		del.SetSpan(stmtSpan)
 		n := &ast.DeleteQueryNode{Delete: del}
+		n.SetSpan(stmtSpan)
+		return n
+	case *ast.CopyStatement:
+		if s.Info != nil && s.Info.IsFrom {
+			raise("COPY FROM cannot be used as a CTE body")
+		}
+		n := &ast.CopyQueryNode{Copy: s.Info}
 		n.SetSpan(stmtSpan)
 		return n
 	}
@@ -290,7 +332,9 @@ func (tc *transformContext) transformSimpleSelect(n tnode) ast.QueryNode {
 				FrameStart: ast.WindowUnboundedPreceding, FrameEnd: ast.WindowCurrentRowRange,
 				ExcludeClause: ast.WindowExcludeNoOther,
 			}
+			tc.inWindowDefinition = true
 			tc.transformWindowFrameDefinition(w, def.child(2))
+			tc.inWindowDefinition = false
 			tc.defineWindow(identifierText(def.child(0)), w)
 		}
 	}
@@ -323,10 +367,12 @@ func (tc *transformContext) transformSimpleSelect(n tnode) ast.QueryNode {
 		if dc, ok := selectClause.child(1).opt(); ok {
 			tc.applyDistinct(node, dc)
 		}
-		if tl, ok := selectClause.child(2).opt(); ok {
-			for _, e := range tl.listElems() {
-				node.SelectList = append(node.SelectList, tc.transformAliasedExpression(e))
-			}
+		tl, hasTargets := selectClause.child(2).opt()
+		if !hasTargets {
+			raise("SELECT clause without selection list")
+		}
+		for _, e := range tl.listElems() {
+			node.SelectList = append(node.SelectList, tc.transformAliasedExpression(e))
 		}
 	} else {
 		star := &ast.StarExpression{}
@@ -416,6 +462,7 @@ func (tc *transformContext) transformGroupBy(node *ast.SelectNode, n tnode) {
 	sets := []ast.GroupingSet{{}}
 	for _, entry := range alt.sole().listElems() {
 		entrySets := tc.transformGroupByExpressionEntry(node, entry)
+		checkGroupingSetMax(len(sets) * len(entrySets))
 		var combined []ast.GroupingSet
 		for _, base := range sets {
 			for _, es := range entrySets {
@@ -425,6 +472,15 @@ func (tc *transformContext) transformGroupBy(node *ast.SelectNode, n tnode) {
 		sets = combined
 	}
 	node.GroupSets = sets
+}
+
+// maxGroupingSets is upstream's grouping set cap.
+const maxGroupingSets = 65535
+
+func checkGroupingSetMax(count int) {
+	if count > maxGroupingSets {
+		raise("Maximum grouping set count of %d exceeded", maxGroupingSets)
+	}
 }
 
 func mergeSet(a, b ast.GroupingSet) ast.GroupingSet {
@@ -508,7 +564,16 @@ func (tc *transformContext) transformGroupByExpressionEntry(node *ast.SelectNode
 				units = append(units, tc.groupByUnit(node, tc.transformExpression(e)))
 			}
 		}
+		if len(units) == 0 {
+			raise("CUBE or ROLLUP column list cannot be empty")
+		}
 		if kind.name() == "CubeKeyword" {
+			// port of CheckGroupingSetCubes: cap before expanding
+			combinations := 1
+			for range units {
+				combinations *= 2
+				checkGroupingSetMax(combinations)
+			}
 			return normalizeSets(cubeSets(units))
 		}
 		return normalizeSets(rollupSets(units))
@@ -840,6 +905,9 @@ func (tc *transformContext) applySampleCount(s *ast.SampleOptions, n tnode, meth
 		if err != nil {
 			raise("invalid sample size")
 		}
+		if f < 0 || f > 100 {
+			raise("Sample sample_size %f out of range, must be between 0 and 100", f)
+		}
 		s.SampleSize = ast.Value{Type: ast.LogicalType{ID: "DOUBLE"}, Kind: ast.ValueDouble, Float64: f}
 		if method == "" {
 			method = "system"
@@ -848,6 +916,11 @@ func (tc *transformContext) applySampleCount(s *ast.SampleOptions, n tnode, meth
 		iv, err := strconv.ParseInt(text, 10, 64)
 		if err != nil {
 			raise("invalid sample size")
+		}
+		// upstream caps row counts at SampleOptions::MAX_SAMPLE_ROWS
+		const maxSampleRows = 1000000000
+		if iv < 0 || iv > maxSampleRows {
+			raise("Sample rows %d out of range, must be between 0 and %d", iv, maxSampleRows)
 		}
 		s.SampleSize = ast.Value{Type: ast.LogicalType{ID: "BIGINT"}, Kind: ast.ValueInt64, Int64: iv}
 		if method == "" {

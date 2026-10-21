@@ -44,8 +44,25 @@ type identifierMatcher struct {
 	display string
 }
 
+// isQuoteDelimiter is IdentifierMatcher::IsQuoteDelimiter.
+func isQuoteDelimiter(c byte) bool {
+	return c == '"' || c == '`'
+}
+
+// isQuoted reports a delimited identifier: "..." or `...`, closed by the
+// delimiter it opened with.
 func isQuoted(text string) bool {
-	return text[0] == '"' && text[len(text)-1] == '"'
+	if len(text) < 2 {
+		return false
+	}
+	return isQuoteDelimiter(text[0]) && text[0] == text[len(text)-1]
+}
+
+// unquoteIdentifier strips the delimiters of a quoted identifier and
+// un-doubles escaped delimiters (IdentifierMatcher::UnquoteIdentifier).
+func unquoteIdentifier(text string) string {
+	delimiter := text[:1]
+	return strings.ReplaceAll(text[1:len(text)-1], delimiter+delimiter, delimiter)
 }
 
 func isSingleQuoted(text string) bool {
@@ -56,11 +73,11 @@ func isSingleQuoted(text string) bool {
 // identifier character.
 func charIsKeywordStart(c byte) bool {
 	switch c {
-	case '(', ')', '{', '}', '[', ']', ',', '?', '$', '-', '#':
+	case '(', ')', '{', '}', '[', ']', ',', ':', '?', '$', '#':
 		// single-byte operators
 		return false
 	case '\'', ';', '"', '.':
-		// control flow ('-' already covered above)
+		// control flow
 		return false
 	}
 	if c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r' {
@@ -85,6 +102,10 @@ func (m *identifierMatcher) isIdentifier(text string) bool {
 	}
 	if text[0] == '.' || (text[0] >= '0' && text[0] <= '9') {
 		// CharacterIsInitialNumber
+		return false
+	}
+	if text[len(text)-1] == '\'' {
+		// a prefixed string literal such as x'41' or e'ab'
 		return false
 	}
 	return charIsKeywordStart(text[0])
@@ -132,23 +153,24 @@ func (m *identifierMatcher) matchInternal(s *state) ParseResult {
 
 	result := text
 	if m.reserved {
-		// ReservedIdentifierMatcher only unwraps double quotes; a
+		// ReservedIdentifierMatcher only unwraps quoted identifiers; a
 		// single-quoted path literal is kept verbatim
 		if isQuoted(result) {
-			result = strings.ReplaceAll(result[1:len(result)-1], `""`, `"`)
+			result = unquoteIdentifier(result)
 		}
 	} else {
 		switch {
 		case isQuoted(result):
-			result = strings.ReplaceAll(result[1:len(result)-1], `""`, `"`)
+			result = unquoteIdentifier(result)
 		case isSingleQuoted(result) && m.supportsStringLiteral:
 			// a single-quoted token in a table or file-name position is a
 			// path: unwrapped but never folded
 			result = strings.ReplaceAll(result[1:len(result)-1], "''", "'")
 		}
 	}
-	// identifier case folding (preserve_identifier_case) is not ported:
+	// identifier case folding (MatchState::FoldIdentifier) is not ported:
 	// darkwing always preserves case, DuckDB's default
+	// (IdentifierCaseMode::PRESERVE_CASE)
 
 	ir := &IdentifierResult{Identifier: result}
 	ir.offset, ir.hasOffset = offset, true
@@ -188,8 +210,16 @@ func (m *numberLiteralMatcher) matchInternal(s *state) ParseResult {
 		return nil
 	}
 	scientific := false
+	hasDot := text[0] == '.'
 	for i := 1; i < len(text); i++ {
 		c := text[i]
+		if c == '.' {
+			// a number has at most one dot, and none in its exponent
+			if hasDot || scientific {
+				return nil
+			}
+			hasDot = true
+		}
 		if c == 'e' || c == 'E' {
 			if scientific {
 				// upstream throws a ParserException here, aborting the
@@ -219,9 +249,12 @@ func (m *numberLiteralMatcher) String() string {
 	return "NUMBER_LITERAL"
 }
 
-// stringLiteralMatcher matches string literal tokens, including prefixed
-// forms (E”, N”, X”, B”). Port of StringLiteralMatcher +
-// special_string_utils.hpp.
+// stringLiteralMatcher matches string literal tokens: single-quoted,
+// including the prefixed forms (E'...', N'...', X'...', B'...'), and
+// dollar-quoted.
+// A single-quoted literal absorbs the plain '...' literals that follow it
+// on later lines ('a'<newline>'b' is 'ab'). Port of StringLiteralMatcher
+// (matcher/string_literal_matcher.hpp) + special_string_utils.hpp.
 type stringLiteralMatcher struct {
 	matcherMeta
 }
@@ -250,27 +283,79 @@ func specialStringInfo(text string) (StringKind, int) {
 	return StringStandard, 1
 }
 
+// isSingleQuotedLiteral is StringLiteralMatcher::IsSingleQuotedStringLiteral.
+func isSingleQuotedLiteral(text string, prefixLen int) bool {
+	if prefixLen == 0 || len(text) < prefixLen+1 {
+		return false
+	}
+	return text[prefixLen-1] == '\'' && text[len(text)-1] == '\''
+}
+
+// dollarQuoteDelimiterLength reports the length of the $tag$ delimiter of
+// a terminated dollar-quoted literal (TryGetDollarQuoteDelimiterLength).
+func dollarQuoteDelimiterLength(tok *token.Token) (int, bool) {
+	text := tok.Text
+	if tok.Unterminated || text == "" || text[0] != '$' {
+		return 0, false
+	}
+	end := strings.IndexByte(text[1:], '$')
+	if end < 0 {
+		return 0, false
+	}
+	length := end + 2
+	if len(text) < length*2 {
+		return 0, false
+	}
+	return length, strings.HasSuffix(text, text[:length])
+}
+
+// stripStringLiteral is StringLiteralMatcher::StripStringLiteral: the
+// contents between the delimiters, with doubled quotes un-doubled in
+// single-quoted literals.
+func stripStringLiteral(tok *token.Token, prefixLen int) string {
+	if length, ok := dollarQuoteDelimiterLength(tok); ok {
+		return tok.Text[length : len(tok.Text)-length]
+	}
+	return strings.ReplaceAll(tok.Text[prefixLen:len(tok.Text)-1], "''", "'")
+}
+
+// isStringContinuation is StringLiteralMatcher::IsStringLiteralContinuation:
+// a plain single-quoted literal on a later line, with no block comment in
+// between.
+func isStringContinuation(tok *token.Token) bool {
+	if tok == nil || !tok.PrecededByNewline || tok.PrecededByBlockComment || tok.Kind != token.String {
+		return false
+	}
+	kind, prefixLen := specialStringInfo(tok.Text)
+	return kind == StringStandard && isSingleQuotedLiteral(tok.Text, prefixLen)
+}
+
 func (m *stringLiteralMatcher) matchInternal(s *state) ParseResult {
 	tok := s.current()
 	if tok == nil {
 		return nil
 	}
-	text := tok.Text
-	kind, prefixLen := specialStringInfo(text)
-	if prefixLen < 1 || len(text) < prefixLen+1 {
-		return nil
-	}
-	if text[prefixLen-1] != '\'' || text[len(text)-1] != '\'' {
+	kind, prefixLen := specialStringInfo(tok.Text)
+	singleQuoted := isSingleQuotedLiteral(tok.Text, prefixLen)
+	if _, dollar := dollarQuoteDelimiterLength(tok); !singleQuoted && !dollar {
 		return nil
 	}
 	offset := tok.Span.Start
-	length := len(text)
+	end := tok.Span.Start + len(tok.Text)
+	value := stripStringLiteral(tok, prefixLen)
 	s.advance()
-	value := strings.ReplaceAll(text[prefixLen:len(text)-1], "''", "'")
+	if singleQuoted {
+		for next := s.current(); isStringContinuation(next); next = s.current() {
+			_, nextPrefix := specialStringInfo(next.Text)
+			value += stripStringLiteral(next, nextPrefix)
+			end = next.Span.Start + len(next.Text)
+			s.advance()
+		}
+	}
 	sr := &StringResult{Value: value, StringKind: kind}
 	sr.name = m.name
 	sr.offset, sr.hasOffset = offset, true
-	sr.length, sr.hasLength = length, true
+	sr.length, sr.hasLength = end-offset, true
 	return sr
 }
 
@@ -278,10 +363,29 @@ func (m *stringLiteralMatcher) String() string {
 	return "STRING_LITERAL"
 }
 
-// operatorMatcher matches generic multi-character operator tokens that are
-// not claimed by dedicated grammar rules. Port of OperatorMatcher.
+// operatorMatcher matches operator tokens. Port of OperatorMatcher
+// (matcher/operator_matcher.hpp): in the default GENERIC_PRECEDENCE mode
+// (OperatorLiteral) it skips the operators the grammar gives a precedence
+// level of their own; in ALL_OPERATORS mode (AnyOperatorLiteral, the
+// operator of ANY/ALL comparisons) it accepts every operator.
 type operatorMatcher struct {
 	matcherMeta
+	allOperators bool
+}
+
+// hasSpecialPrecedence is OperatorMatcher::HasSpecialPrecedence
+// (operator_matcher.cpp): the comparison, LIKE-family and lambda-arrow
+// operators.
+func hasSpecialPrecedence(op string) bool {
+	switch op {
+	case "=", "<", ">", "~",
+		"->", "<=", ">=", "!=", "==", "<>", "~~", "~*", "!~",
+		"~~*", "~~~", "!~~", "!~*",
+		"!~~*":
+		return true
+	default:
+		return false
+	}
 }
 
 func isOperatorChar(c byte) bool {
@@ -299,23 +403,7 @@ func (m *operatorMatcher) matchInternal(s *state) ParseResult {
 		return nil
 	}
 	text := tok.Text
-	// exclude the lambda arrow and JSON arrow - these have dedicated
-	// grammar roles
-	if text == "->" || text == "->>" {
-		return nil
-	}
-	// single-character operators are handled at specific precedence levels
-	if len(text) == 1 {
-		return nil
-	}
-	// exclude known comparison operators - handled by ComparisonExpression
-	switch text {
-	case "<=", ">=", "!=", "==", "<>":
-		return nil
-	}
-	// exclude LIKE/SIMILAR operators - handled by LikeVariations
-	switch text {
-	case "~~", "~~*", "~~~", "~*", "!~~", "!~~*", "!~", "!~*":
+	if !m.allOperators && hasSpecialPrecedence(text) {
 		return nil
 	}
 	for i := 0; i < len(text); i++ {

@@ -24,15 +24,18 @@ func TestDefaultEngineCompiles(t *testing.T) {
 	}
 }
 
-// Every rule override must name a rule the vendored grammar defines (or,
-// for EndOfInput, the implicit rule the loader adds), so the transcribed
-// table cannot drift silently from upstream.
+// Every rule override must name a rule the vendored grammar defines
+// (except EndOfInput, which has no grammar rule upstream either), so the
+// transcribed table cannot drift silently from upstream.
 func TestOverridesExistInGrammar(t *testing.T) {
 	g, err := grammar.Load()
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, name := range OverrideRuleNames() {
+		if name == "EndOfInput" {
+			continue
+		}
 		if g.Rule(name) == nil {
 			t.Errorf("override %q has no rule in the vendored grammar", name)
 		}
@@ -111,7 +114,7 @@ func TestAcceptStatements(t *testing.T) {
 		"FROM t SELECT x",
 		"FROM t",
 		"SELECT * EXCLUDE (a) REPLACE (b + 1 AS b) FROM t",
-		"1 + 1",
+		"SELECT 1 + 1",
 		"SELECT [1, 2, 3]",
 		"SELECT {'a': 1}",
 		"SELECT x -> x + 1",
@@ -197,6 +200,8 @@ func TestRejectStatements(t *testing.T) {
 		{"CREATE 1", "1"},
 		{"SELECT * FROM WHERE", "WHERE"},
 		{"INSERT INTO", "INTO"},
+		// v2.0.0 dropped the bare-expression statement (ExpressionStatement)
+		{"1 + 1", "1"},
 	}
 	for _, tc := range rejected {
 		_, err := matchAll(t, engine, tc.sql)
@@ -235,9 +240,10 @@ func TestKeywordCategoryMatching(t *testing.T) {
 }
 
 // Negative lookahead (`!`) is parsed but ignored by the matcher,
-// replicating the pinned DuckDB build (acknowledged upstream TODO in
-// matcher_factory.cpp). "Ignored" means only the `!` operator itself is
-// dropped: its operand stays in the sequence as an ordinary CONSUMING
+// replicating the pinned DuckDB build (acknowledged upstream FIXME in
+// peg_parser.cpp's PEGExpressionParser). "Ignored" means only the `!`
+// operator itself is dropped: its operand stays in the sequence as an
+// ordinary CONSUMING
 // element. Textbook PEG would make `!'A' 'A'` unsatisfiable; the pinned
 // behavior matches two A tokens. Flip this test in lockstep with
 // upstream, never independently. (The vendored grammar's only bare `!` is
@@ -260,10 +266,11 @@ func TestNegativeLookaheadIgnored(t *testing.T) {
 	}
 }
 
-// The `/` operator binds only the immediately preceding element: upstream
-// compiles `A B / C` as A (B / C), which is why the vendored grammars
-// parenthesize multi-token alternatives. Pin that quirk.
-func TestChoiceBindsLastElement(t *testing.T) {
+// The `/` operator separates whole sequences: since v2.0.0 upstream parses
+// rules with a precedence-aware expression parser, so `A B / C` is
+// (A B) / C. (The pre-v2.0.0 matcher factory bound `/` to the immediately
+// preceding element only, compiling it as A (B / C).)
+func TestChoiceBindsSequences(t *testing.T) {
 	g, err := grammar.Parse("Root <- 'A' 'B' / 'C'\n")
 	if err != nil {
 		t.Fatal(err)
@@ -272,13 +279,36 @@ func TestChoiceBindsLastElement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// "A C" matches: A then (B / C)
-	if _, _, err := engine.Match(mustTokens(t, "A C"), 0); err != nil {
-		t.Errorf("A C should match A (B / C): %v", err)
+	for _, sql := range []string{"A B", "C"} {
+		if _, _, err := engine.Match(mustTokens(t, sql), 0); err != nil {
+			t.Errorf("%s should match (A B) / C: %v", sql, err)
+		}
 	}
-	// bare "C" does not: the leading A is required
-	if _, _, err := engine.Match(mustTokens(t, "C"), 0); err == nil {
-		t.Error("C alone should not match A (B / C)")
+	if _, _, err := engine.Match(mustTokens(t, "A C"), 0); err == nil {
+		t.Error("A C should not match (A B) / C")
+	}
+}
+
+// Postfix operators bind their primary only, and the rule body of a
+// parenthesized sequence is the rule's own list (no extra nesting).
+func TestRuleBodyShape(t *testing.T) {
+	g, err := grammar.Parse("Root <- ('A' 'B')\nOther <- ('A')\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"Root", "Other"} {
+		engine, err := New(g, name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r, _, err := engine.Match(mustTokens(t, "A B"), 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		list := r.(*ListResult)
+		if _, ok := list.Child(0).(*KeywordResult); !ok {
+			t.Errorf("%s child 0 = %T, want *KeywordResult", name, list.Child(0))
+		}
 	}
 }
 

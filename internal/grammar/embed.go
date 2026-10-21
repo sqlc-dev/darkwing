@@ -141,12 +141,9 @@ func Load() (*Grammar, error) {
 			loadErr = fmt.Errorf("parsing embedded grammar: %w", err)
 			return
 		}
-		// Upstream's ParsedGrammar::CreateDefault adds an empty EndOfInput
-		// rule when the grammar text does not define one; the matcher
-		// satisfies it with a rule override.
-		if g.Rule("EndOfInput") == nil {
-			g.addRule(&Rule{Name: "EndOfInput"})
-		}
+		// EndOfInput is not a grammar rule: the matcher satisfies the
+		// references with a rule override (upstream's CompiledGrammar
+		// CheckReference exempts it)
 		loaded = g
 	})
 	return loaded, loadErr

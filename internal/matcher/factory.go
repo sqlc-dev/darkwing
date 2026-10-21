@@ -8,11 +8,10 @@ import (
 )
 
 // factory compiles grammar rules into a matcher tree. Port of
-// MatcherFactory (matcher_factory.cpp): the flat token stream of each rule
-// is interpreted with a stack of open lists; `/` `?` `*` `+` rewrite the
-// most recent element, replicating upstream's (deliberately ported)
-// binding quirks — `/` binds only the immediately preceding element, which
-// is why upstream grammars parenthesize multi-token alternatives.
+// MatcherFactory (matcher_factory.cpp): each rule's expression tree
+// (grammar.Expression) maps one-to-one onto list, choice, optional and
+// repeat matchers, with references resolved to the cached rule matchers
+// and the rule overrides.
 type factory struct {
 	grammar *grammar.Grammar
 	// matchers caches rule matchers by rule name and holds the rule
@@ -98,83 +97,10 @@ func (f *factory) addRuleOverride(name string, m matcher) {
 	f.matchers[name] = m
 }
 
-// stack entry for interpreting one rule's token stream. Port of
-// MatcherFactory::MatcherList.
-type stackEntry struct {
-	m            matcher
-	functionName string
-	isFunction   bool
-}
-
-type matcherStack struct {
-	f       *factory
-	entries []stackEntry
-}
-
-func (ms *matcherStack) addRoot(m matcher) {
-	ms.entries = append(ms.entries, stackEntry{m: m})
-}
-
-func (ms *matcherStack) beginFunction(name string) {
-	ms.entries = append(ms.entries, stackEntry{m: ms.f.newList(), functionName: name, isFunction: true})
-}
-
-func (ms *matcherStack) addMatcher(m matcher) error {
-	root := ms.entries[len(ms.entries)-1].m
-	switch root := root.(type) {
-	case *listMatcher:
-		root.children = append(root.children, m)
-	case *choiceMatcher:
-		// for a choice matcher we pop the choice from the stack after
-		// adding the alternative
-		if len(ms.entries) <= 1 {
-			return fmt.Errorf("choice matcher should never be the root in the matcher stack")
-		}
-		root.children = append(root.children, m)
-		ms.entries = ms.entries[:len(ms.entries)-1]
-	default:
-		return fmt.Errorf("cannot add matcher to root matcher of this type")
-	}
-	return nil
-}
-
-func (ms *matcherStack) closeBracket() error {
-	if len(ms.entries) <= 1 {
-		return fmt.Errorf("PEG matcher create error - found too many close brackets")
-	}
-	top := ms.entries[len(ms.entries)-1]
-	if !top.isFunction {
-		ms.entries = ms.entries[:len(ms.entries)-1]
-		return ms.addMatcher(top.m)
-	}
-	// function matcher: substitute the parameterized rule
-	params := top.m.(*listMatcher)
-	var param matcher
-	if len(params.children) == 1 {
-		param = params.children[0]
-	} else {
-		param = ms.f.newListWith(params.children)
-	}
-	call, err := ms.f.createMatcher(top.functionName, []matcher{param})
-	if err != nil {
-		return err
-	}
-	ms.entries = ms.entries[:len(ms.entries)-1]
-	return ms.addMatcher(call)
-}
-
-func (ms *matcherStack) lastRootList() (*listMatcher, error) {
-	root, ok := ms.entries[len(ms.entries)-1].m.(*listMatcher)
-	if !ok {
-		return nil, fmt.Errorf("expected a list matcher")
-	}
-	return root, nil
-}
-
 // createMatcher builds (and caches) the matcher for a rule, recursively
 // building referenced rules. params carries macro arguments for
 // parameterized rules (List(D), Parens(D)). Port of
-// MatcherFactory::CreateMatcher.
+// MatcherFactory::CreateMatcher(rule_name, parameters).
 func (f *factory) createMatcher(ruleName string, params []matcher) (matcher, error) {
 	isFunctionCall := len(params) > 0
 	if !isFunctionCall {
@@ -187,13 +113,11 @@ func (f *factory) createMatcher(ruleName string, params []matcher) (matcher, err
 		return nil, fmt.Errorf("failed to create matcher for rule %s - rule is missing", ruleName)
 	}
 	// matchers can be recursive: cache before recursively constructing
+	// (upstream registers every rule's list matcher up front)
 	root := f.newList()
 	if !isFunctionCall {
 		f.matchers[rule.Name] = root
 	}
-
-	stack := &matcherStack{f: f}
-	stack.addRoot(root)
 	if len(rule.Parameters) > 1 {
 		return nil, fmt.Errorf("only functions with a single parameter are supported")
 	}
@@ -201,37 +125,16 @@ func (f *factory) createMatcher(ruleName string, params []matcher) (matcher, err
 		return nil, fmt.Errorf("parameter count mismatch (rule %s expected %d parameters but got %d)",
 			ruleName, len(rule.Parameters), len(params))
 	}
-	for _, tok := range rule.Tokens {
-		var err error
-		switch tok.Type {
-		case grammar.Literal:
-			err = stack.addMatcher(f.keyword(tok.Text))
-		case grammar.Reference:
-			if idx, ok := rule.Parameters[tok.Text]; ok {
-				// refers to a macro parameter - use it directly
-				err = stack.addMatcher(params[idx])
-			} else {
-				var child matcher
-				child, err = f.createMatcher(tok.Text, nil)
-				if err == nil {
-					err = stack.addMatcher(child)
-				}
-			}
-		case grammar.FunctionCall:
-			stack.beginFunction(tok.Text)
-		case grammar.Operator:
-			err = f.applyOperator(stack, ruleName, tok.Text[0])
-		case grammar.Regex:
-			err = fmt.Errorf("REGEX operator not supported in PEG grammar (found in rule %s)", ruleName)
-		default:
-			err = fmt.Errorf("unrecognized peg token type")
-		}
-		if err != nil {
-			return nil, err
-		}
+	body, err := f.createExpression(ruleName, rule.Expression, rule.Parameters, params)
+	if err != nil {
+		return nil, err
 	}
-	if len(stack.entries) != 1 {
-		return nil, fmt.Errorf("PEG matcher create error - unclosed bracket found in rule %s", ruleName)
+	// a sequence body becomes the rule's own list; anything else is its
+	// single element
+	if rule.Expression.Type == grammar.ExprSequence {
+		root.children = body.(*listMatcher).children
+	} else {
+		root.children = []matcher{body}
 	}
 
 	root.setRule(rule.Name)
@@ -241,93 +144,83 @@ func (f *factory) createMatcher(ruleName string, params []matcher) (matcher, err
 	return root, nil
 }
 
-func (f *factory) applyOperator(stack *matcherStack, ruleName string, op byte) error {
-	switch op {
-	case '?', '*':
-		// optional/repeat rewrites the most recent element of the current
-		// list; '*' is Optional(Repeat(child))
-		root, err := stack.lastRootList()
+// createExpression builds the matcher for one expression node. Port of
+// MatcherFactory::CreateMatcher(expression, parameter_map, parameters).
+func (f *factory) createExpression(ruleName string, expr *grammar.Expression, paramMap map[string]int, params []matcher) (matcher, error) {
+	switch expr.Type {
+	case grammar.ExprLiteral:
+		return f.keyword(expr.Text), nil
+	case grammar.ExprReference:
+		if idx, ok := paramMap[expr.Text]; ok {
+			// refers to a macro parameter - use it directly
+			return params[idx], nil
+		}
+		return f.createMatcher(expr.Text, nil)
+	case grammar.ExprFunctionCall:
+		if len(expr.Children) != 1 {
+			return nil, fmt.Errorf("function call '%s' expected a single argument", expr.Text)
+		}
+		param, err := f.createExpression(ruleName, expr.Children[0], paramMap, params)
 		if err != nil {
-			return fmt.Errorf("optional/repeat in rule %s: %w", ruleName, err)
+			return nil, err
 		}
-		if len(root.children) == 0 {
-			return fmt.Errorf("optional/repeat rule found as first token in rule %s", ruleName)
+		return f.createMatcher(expr.Text, []matcher{param})
+	case grammar.ExprSequence, grammar.ExprChoice:
+		children := make([]matcher, 0, len(expr.Children))
+		for _, child := range expr.Children {
+			m, err := f.createExpression(ruleName, child, paramMap, params)
+			if err != nil {
+				return nil, err
+			}
+			children = append(children, m)
 		}
-		final := root.children[len(root.children)-1]
-		if op == '*' {
-			final = f.newRepeat(final)
+		if expr.Type == grammar.ExprSequence {
+			return f.newListWith(children), nil
 		}
-		root.children[len(root.children)-1] = f.newOptional(final)
-	case '+':
-		root, err := stack.lastRootList()
+		// upstream compiles an all-keyword choice to a LiteralChoiceMatcher
+		// that dispatches on the token's literal id; it picks the same
+		// alternative as trying them in order, so the plain choice stands
+		// in for it
+		return f.newChoice(children), nil
+	case grammar.ExprOptional, grammar.ExprRepeat, grammar.ExprOptionalRepeat:
+		if len(expr.Children) != 1 {
+			return nil, fmt.Errorf("PEG postfix expression expected a single child")
+		}
+		child, err := f.createExpression(ruleName, expr.Children[0], paramMap, params)
 		if err != nil {
-			return fmt.Errorf("repeat in rule %s: %w", ruleName, err)
+			return nil, err
 		}
-		if len(root.children) == 0 {
-			return fmt.Errorf("repeat rule found as first token in rule %s", ruleName)
+		switch expr.Type {
+		case grammar.ExprOptional:
+			return f.newOptional(child), nil
+		case grammar.ExprRepeat:
+			return f.newRepeat(child), nil
+		default:
+			// '*' is Optional(Repeat(child))
+			return f.newOptional(f.newRepeat(child)), nil
 		}
-		final := root.children[len(root.children)-1]
-		root.children[len(root.children)-1] = f.newRepeat(final)
-	case '/':
-		// ordered choice between the most recent element and what follows
-		root, err := stack.lastRootList()
-		if err != nil {
-			return fmt.Errorf("OR in rule %s: %w", ruleName, err)
-		}
-		if len(root.children) == 0 {
-			return fmt.Errorf("OR rule found as first token in rule %s", ruleName)
-		}
-		previous := root.children[len(root.children)-1]
-		if choice, ok := previous.(*choiceMatcher); ok {
-			stack.addRoot(choice)
-		} else {
-			choice := f.newChoice([]matcher{previous})
-			root.children[len(root.children)-1] = choice
-			stack.addRoot(choice)
-		}
-	case '(':
-		stack.addRoot(f.newList())
-	case ')':
-		return stack.closeBracket()
-	case '!':
-		// negative lookahead is parsed but ignored, replicating the pinned
-		// DuckDB build (an acknowledged upstream TODO). Flip this in
-		// lockstep with upstream, never independently.
+	case grammar.ExprRegex:
+		return nil, fmt.Errorf("REGEX operator not supported in PEG grammar (found in rule %s)", ruleName)
 	default:
-		return fmt.Errorf("unrecognized peg operator type %q", string(op))
+		return nil, fmt.Errorf("unrecognized PEG expression type")
 	}
-	return nil
 }
 
 //===----------------------------------------------------------------------===//
-// Generated tables (transcribed from matcher_factory.cpp)
+// Generated tables (transcribed from matcher_factory.cpp and
+// compiled_grammar.cpp)
 //===----------------------------------------------------------------------===//
 
 // packratMemoizedRules is upstream's designated hot-rule list
 // (START/END GENERATED PACKRAT MEMOIZED RULES).
 var packratMemoizedRules = []string{
 	"Expression",
-	"LambdaArrowExpression",
-	"LogicalOrExpression",
-	"LogicalAndExpression",
-	"LogicalNotExpression",
-	"IsExpression",
-	"ComparisonExpression",
-	"BitwiseExpression",
-	"AdditiveExpression",
-	"MultiplicativeExpression",
-	"ExponentiationExpression",
-	"PrefixExpression",
-	"CollateExpression",
-	"AtTimeZoneExpression",
-	"SingleExpression",
-	"BaseExpression",
-	"ParensExpression",
-	"ParenthesisExpression",
+	"TableRef",
 	"Identifier",
 	"ColId",
-	"ColumnReference",
-	"FunctionExpression",
+	"CatalogQualification",
+	"SchemaQualification",
+	"ReservedSchemaQualification",
 }
 
 // installOverrides transcribes upstream's rule override table
@@ -366,6 +259,7 @@ func (f *factory) installOverrides() {
 	f.addRuleOverride("NumberLiteral", &numberLiteralMatcher{matcherMeta: matcherMeta{name: "NumberLiteral"}})
 	f.addRuleOverride("StringLiteral", &stringLiteralMatcher{matcherMeta: matcherMeta{name: "StringLiteral"}})
 	f.addRuleOverride("OperatorLiteral", &operatorMatcher{})
+	f.addRuleOverride("AnyOperatorLiteral", &operatorMatcher{allOperators: true})
 
 	// EndOfInput has no grammar body; satisfied here, as upstream does
 	// outside the regenerated block
@@ -382,6 +276,6 @@ func OverrideRuleNames() []string {
 		"FunctionName", "ReservedFunctionName", "ReservedKeyword",
 		"TableFunctionName", "TypeName", "ReservedTypeName", "PragmaName",
 		"SettingName", "CopyOptionName", "NumberLiteral", "StringLiteral",
-		"OperatorLiteral", "EndOfInput",
+		"OperatorLiteral", "AnyOperatorLiteral", "EndOfInput",
 	}
 }

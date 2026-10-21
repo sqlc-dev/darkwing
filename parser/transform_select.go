@@ -59,7 +59,7 @@ func (tc *transformContext) transformWithClause(n tnode) ast.CTEMap {
 		name, cte := tc.transformWithStatement(ws, recursive)
 		key := strings.ToLower(name)
 		if seen[key] {
-			raise("Duplicate CTE name \"%s\"", name)
+			raise("Duplicate CTE name %s", quoteIdent(name))
 		}
 		seen[key] = true
 		out.Entries = append(out.Entries, ast.CTEMapEntry{Name: name, CTE: cte})
@@ -67,13 +67,14 @@ func (tc *transformContext) transformWithClause(n tnode) ast.CTEMap {
 	return out
 }
 
-// WithStatement <- ColIdOrString InsertColumnList? UsingKey? 'AS' Materialized? CTEBody
+// WithStatement <- ColIdOrString ColumnAliases? UsingKey? 'AS' Materialized? CTEBody
 func (tc *transformContext) transformWithStatement(n tnode, recursive bool) (string, *ast.CommonTableExpr) {
 	name := identifierText(n.child(0))
 	cte := &ast.CommonTableExpr{Materialized: ast.CTEMaterializeDefault}
 	cte.SetSpan(n.span())
 	if cols, ok := n.child(1).opt(); ok {
-		cte.Aliases = identifierList(cols.sole().parens())
+		// ColumnAliases <- Parens(List(ColIdOrString))
+		cte.Aliases = identifierList(cols.parens())
 	}
 	if uk, ok := n.child(2).opt(); ok {
 		// UsingKey <- 'USING' 'KEY' Parens(TargetList)
@@ -432,9 +433,6 @@ func (tc *transformContext) transformAliasedExpression(n tnode) ast.Expr {
 			expr.SetAlias(identifierText(id))
 		}
 		return expr
-	case "Expression":
-		// ExpressionAlias (expression statements) reuses this dispatch
-		return tc.transformExpression(alt)
 	}
 	shapeError(alt, "unknown aliased expression")
 	return nil
@@ -500,7 +498,8 @@ func normalizeSet(s ast.GroupingSet) ast.GroupingSet {
 	return out
 }
 
-// peekBareStar reports whether a GroupByExpression entry is a bare `*`.
+// peekBareStar reports whether a GroupByExpression entry is a bare `*`
+// (ExpressionIsEmptyStar: a qualified `t.*` counts too).
 func (tc *transformContext) peekBareStar(n tnode) (bool, bool) {
 	_, alt := n.sole().choice()
 	if alt.name() != "GroupByBaseExpression" {
@@ -508,7 +507,7 @@ func (tc *transformContext) peekBareStar(n tnode) (bool, bool) {
 	}
 	expr := tc.transformExpression(alt.sole())
 	star, ok := expr.(*ast.StarExpression)
-	if !ok || star.Columns || star.Expr != nil || star.RelationName != "" ||
+	if !ok || star.Columns || star.Expr != nil ||
 		len(star.ExcludeList) != 0 || len(star.ReplaceList) != 0 ||
 		len(star.QualifiedExcludeList) != 0 || len(star.RenameList) != 0 {
 		return false, false
@@ -693,7 +692,8 @@ func nullOrderOf(n tnode) ast.NullOrder {
 	return ast.NullsLast
 }
 
-// LimitOffset <- LimitOffsetClause / OffsetFetchClause / OffsetLimitClause / FetchOnlyClause
+// LimitOffset <- LimitOffsetClause / OffsetFetchClause / OffsetLimitClause /
+// FetchOffsetClause / FetchOnlyClause
 func (tc *transformContext) transformLimitOffset(n tnode) []ast.ResultModifier {
 	_, alt := n.sole().choice()
 	mod := &ast.LimitModifier{LimitType: ast.LimitRowCount}
@@ -712,6 +712,10 @@ func (tc *transformContext) transformLimitOffset(n tnode) []ast.ResultModifier {
 	case "OffsetFetchClause":
 		mod.Offset = tc.transformOffsetValue(alt.child(0))
 		mod.Limit = tc.transformFetchValue(alt.child(1))
+	case "FetchOffsetClause":
+		// FetchClause OffsetClause (v2.0)
+		mod.Limit = tc.transformFetchValue(alt.child(0))
+		mod.Offset = tc.transformOffsetValue(alt.child(1))
 	case "FetchOnlyClause":
 		mod.Limit = tc.transformFetchValue(alt.sole())
 	default:
@@ -729,7 +733,7 @@ func (tc *transformContext) applyLimitClause(mod *ast.LimitModifier, n tnode) {
 		// LIMIT ALL is an explicit NULL limit
 		mod.Limit = constExpr(invalidSpan, ast.Value{Type: ast.LogicalType{ID: "NULL"}, IsNull: true, Kind: ast.ValueNull})
 	case "LimitLiteralPercent":
-		mod.Limit = numberConstant(alt.child(0).span(), alt.child(0).number())
+		mod.Limit = numberConstant(invalidSpan, alt.child(0).number())
 		mod.LimitType = ast.LimitPercentage
 	case "LimitExpression":
 		// Expression '%'?
@@ -747,9 +751,16 @@ func (tc *transformContext) transformOffsetValue(n tnode) ast.Expr {
 	return tc.transformExpression(n.child(1).child(0))
 }
 
-// FetchClause <- 'FETCH' FirstOrNext FetchValue RowOrRows 'ONLY'
+// FetchClause <- FetchClauseWithoutValue / FetchClauseWithValue
+// FetchClauseWithValue <- 'FETCH' FirstOrNext FetchValue RowOrRows 'ONLY'
+// FetchClauseWithoutValue <- 'FETCH' FirstOrNext RowOrRows 'ONLY' fetches
+// one row (TransformFetchClauseWithoutValue: a location-free 1).
 func (tc *transformContext) transformFetchValue(n tnode) ast.Expr {
-	return tc.transformExpression(n.child(2).sole())
+	_, alt := n.sole().choice()
+	if alt.name() == "FetchClauseWithoutValue" {
+		return intConst(invalidSpan, 1)
+	}
+	return tc.transformExpression(alt.child(2).sole())
 }
 
 // ---- SHOW / DESCRIBE / SUMMARIZE --------------------------------------
@@ -871,17 +882,7 @@ func (tc *transformContext) transformDescribeTarget(alt tnode) describeTarget {
 // fillQualifiedTable fills a ref from a QualifiedTableName alternative
 // (CatalogReservedSchemaTable / SchemaReservedTable).
 func (tc *transformContext) fillQualifiedTable(ref *ast.BaseTableRef, alt tnode) {
-	switch alt.name() {
-	case "CatalogReservedSchemaTable":
-		ref.CatalogName = identifierText(alt.child(0).child(0))
-		ref.SchemaName = lastSchemaQualification(alt.child(1))
-		ref.TableName = identifierText(alt.child(2))
-	case "SchemaReservedTable":
-		ref.SchemaName = identifierText(alt.child(0).child(0))
-		ref.TableName = identifierText(alt.child(1))
-	default:
-		shapeError(alt, "unknown qualified table name")
-	}
+	tc.fillTableNameAlt(ref, alt)
 }
 
 // trySetSpecialShowForm ports TrySetSpecialShowForm: an unqualified
@@ -918,6 +919,7 @@ func (tc *transformContext) buildShowByName(ref *ast.ShowRef, targetNode tnode) 
 		ref.CatalogName = target.table.CatalogName
 		ref.SchemaName = target.table.SchemaName
 		ref.TableName = target.table.TableName
+		ref.Qualification = target.table.Qualification
 		ref.Query = starSelect(target.table, invalidSpan)
 	default:
 		ref.TableName = target.table.TableName
@@ -1049,44 +1051,6 @@ func formatSampleMethod(m string) ast.SampleMethod {
 	}
 	lower := strings.ToLower(m)
 	return ast.SampleMethod(strings.ToUpper(lower[:1]) + lower[1:])
-}
-
-// ExpressionStatement <- List(ExpressionAlias): a bare expression list is
-// a SELECT without a FROM clause.
-func init() {
-	register("ExpressionStatement", func(tc *transformContext, n tnode) ast.Stmt {
-		node := &ast.SelectNode{AggregateHandling: ast.StandardHandling}
-		node.SetSpan(n.span())
-		empty := &ast.EmptyTableRef{}
-		empty.SetSpan(invalidSpan)
-		node.FromTable = empty
-		for _, e := range n.sole().listElems() {
-			node.SelectList = append(node.SelectList, tc.transformAliasedExpression(e))
-		}
-		// a single bare column reference is a table query (`foo` is
-		// upstream's SELECT * FROM foo)
-		if len(node.SelectList) == 1 {
-			if ref, ok := node.SelectList[0].(*ast.ColumnRefExpression); ok && ref.GetAlias() == "" && len(ref.ColumnNames) <= 3 {
-				table := &ast.BaseTableRef{}
-				table.SetSpan(invalidSpan)
-				names := ref.ColumnNames
-				table.TableName = names[len(names)-1]
-				if len(names) >= 2 {
-					table.SchemaName = names[len(names)-2]
-				}
-				if len(names) == 3 {
-					table.CatalogName = names[0]
-				}
-				sel := starSelect(table, n.span())
-				stmt := &ast.SelectStatement{Node: sel}
-				stmt.SetSpan(n.span())
-				return stmt
-			}
-		}
-		stmt := &ast.SelectStatement{Node: node}
-		stmt.SetSpan(n.span())
-		return stmt
-	})
 }
 
 // normalizeKeyword upper-cases a keyword spelling for comparisons.

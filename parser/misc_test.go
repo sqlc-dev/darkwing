@@ -499,12 +499,18 @@ func TestCollateNames(t *testing.T) {
 }
 
 // TestUnconvertibleNumberLiterals: a number token whose text has no
-// value ("2.03.0") still parses — upstream throws InvalidInputException
-// only while constructing the value, which is post-parse under the
-// oracle's classification (found by cmd/difftest).
+// value ("2.03.0") is a syntax error since v2.0.0 (the pinned oracle
+// reports `syntax error at or near "2.03.0"`; before, the token parsed
+// and failed only when the value was constructed).
 func TestUnconvertibleNumberLiterals(t *testing.T) {
-	parseOne(t, "SELECT 2.03.0")
-	parseOne(t, "SELECT list_position([1.0,2.03.0,]::varchar[], 'a')")
-	parseOne(t, "SELECT 12.5.5.5")
-	parseOne(t, "SELECT 999999999999999999999999999999999999999999.1.1")
+	for _, tc := range []struct{ sql, tok string }{
+		{"SELECT 2.03.0", "2.03.0"},
+		{"SELECT list_position([1.0,2.03.0,]::varchar[], 'a')", "2.03.0"},
+		{"SELECT 12.5.5.5", "12.5.5.5"},
+		{"SELECT 999999999999999999999999999999999999999999.1.1", "999999999999999999999999999999999999999999.1.1"},
+	} {
+		if msg, want := parseErr(t, tc.sql), `syntax error at or near "`+tc.tok+`"`; msg != want {
+			t.Errorf("Parse(%q) = %q, want %q", tc.sql, msg, want)
+		}
+	}
 }

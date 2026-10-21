@@ -122,6 +122,8 @@ func queryNode(n ast.QueryNode) map[string]any {
 		base["table"] = ins.Table
 		base["schema"] = ins.Schema
 		base["catalog"] = ins.Catalog
+		// v2.0 storage also writes the target's QualifiedName
+		base["qualified_name"] = map[string]any{"path": qualifiedPath(ins.Catalog, ins.Schema, nil, ins.Table)}
 		base["returning_list"] = exprList(ins.Returning)
 		base["on_conflict_info"] = onConflictInfo(ins.OnConflict)
 		// upstream materializes the insert target as a table ref only
@@ -286,14 +288,11 @@ func tableRef(r ast.TableRef) map[string]any {
 			"type": "EMPTY", "alias": ref.Alias, "sample": sampleOptions(ref.Sample),
 		}, ref.Span)
 	case *ast.BaseTableRef:
-		path := []any{}
-		if ref.CatalogName != "" {
-			path = append(path, ref.CatalogName)
+		path := qualifiedPath(ref.CatalogName, ref.SchemaName, ref.Qualification, ref.TableName)
+		if len(path) == 0 {
+			// BaseTableRef::SetTable always records the name, even ""
+			path = []any{""}
 		}
-		if ref.SchemaName != "" {
-			path = append(path, ref.SchemaName)
-		}
-		path = append(path, ref.TableName)
 		return locate(map[string]any{
 			"type": "BASE_TABLE", "alias": ref.Alias, "sample": sampleOptions(ref.Sample),
 			"schema_name": ref.SchemaName, "table_name": ref.TableName,
@@ -384,6 +383,10 @@ func tableRef(r ast.TableRef) map[string]any {
 // query-only ShowRef.
 func showRefPath(ref *ast.ShowRef) map[string]any {
 	path := []any{}
+	if len(ref.Qualification) > 0 {
+		// a nested schema chain keeps its full path
+		return map[string]any{"path": qualifiedPath("", "", ref.Qualification, ref.TableName)}
+	}
 	if ref.ShowType == ast.ShowTypeShowFrom || ref.TableName != "" || ref.SchemaName != "" {
 		if ref.CatalogName != "" {
 			path = append(path, ref.CatalogName)
@@ -544,7 +547,8 @@ func expr(e ast.Expr) map[string]any {
 	case *ast.ConstantExpression:
 		base["class"] = "CONSTANT"
 		base["type"] = "VALUE_CONSTANT"
-		base["value"] = value(x.Value)
+		// v2.0 storage writes the literal as written (Literal: kind, text)
+		base["literal"] = map[string]any{"kind": string(x.Literal.Kind), "text": x.Literal.Text}
 		locate(base, x.Span)
 	case *ast.ParameterExpression:
 		base["class"] = "PARAMETER"
@@ -563,6 +567,7 @@ func expr(e ast.Expr) map[string]any {
 		base["is_operator"] = x.IsOperator
 		base["export_state"] = x.ExportState
 		base["arguments"] = functionArguments(x.Arguments)
+		base["qualified_name"] = map[string]any{"path": qualifiedPath(x.Catalog, x.Schema, x.Qualification, x.FunctionName)}
 		locate(base, x.Span)
 	case *ast.OperatorExpression:
 		base["class"] = "OPERATOR"
@@ -584,7 +589,8 @@ func expr(e ast.Expr) map[string]any {
 		base["class"] = "CAST"
 		base["type"] = "OPERATOR_CAST"
 		base["child"] = expr(x.Child)
-		base["cast_type"] = castType(x)
+		// v2.0 storage writes the target as a type expression (type_expr)
+		base["type_expr"] = castTypeExpr(x)
 		base["try_cast"] = x.TryCast
 		locate(base, x.Span)
 	case *ast.CaseExpression:
@@ -670,6 +676,7 @@ func expr(e ast.Expr) map[string]any {
 		base["schema"] = x.Schema
 		base["type_name"] = x.TypeName
 		base["children"] = exprList(x.Args)
+		base["qualified_name"] = map[string]any{"path": qualifiedPath(x.Catalog, x.Schema, x.Qualification, x.TypeName)}
 		locate(base, x.Span)
 	case *ast.WindowExpression:
 		base["class"] = "WINDOW"
@@ -692,6 +699,7 @@ func expr(e ast.Expr) map[string]any {
 		base["distinct"] = x.Distinct
 		base["arg_orders"] = orderList(x.ArgOrders)
 		base["arguments"] = functionArguments(x.Arguments)
+		base["qualified_name"] = map[string]any{"path": qualifiedPath(x.Catalog, x.Schema, x.Qualification, x.FunctionName)}
 		locate(base, x.Span)
 	default:
 		panic(fmt.Sprintf("serialize: unknown expression %T", e))
@@ -699,21 +707,50 @@ func expr(e ast.Expr) map[string]any {
 	return base
 }
 
-// castType renders a CastExpression's target: a resolved logical type id
-// or an UNBOUND type wrapping the type expression.
-func castType(x *ast.CastExpression) map[string]any {
-	if x.ResolvedType != "" {
-		return map[string]any{"id": x.ResolvedType, "type_info": nil}
+// castTypeExpr renders a CastExpression's target type expression: the
+// parsed type, or for a pre-resolved logical type the location-free
+// TypeExpression::FromLogicalType spelling.
+func castTypeExpr(x *ast.CastExpression) map[string]any {
+	if x.ResolvedType == "" {
+		return expr(x.CastType)
 	}
-	return map[string]any{
-		"id": "UNBOUND",
-		"type_info": map[string]any{
-			"type":           "UNBOUND_TYPE_INFO",
-			"alias":          "",
-			"extension_info": nil,
-			"expr":           expr(x.CastType),
-		},
+	name := x.ResolvedType
+	if alias, ok := builtinTypeNames[name]; ok {
+		name = alias
 	}
+	t := &ast.TypeExpression{TypeName: name}
+	t.SetSpan(ast.Span{Start: -1, End: -1})
+	return expr(t)
+}
+
+// builtinTypeNames maps the logical type ids whose BuiltinTypeName
+// (type_expression.cpp) differs from the id.
+var builtinTypeNames = map[string]string{
+	"TIMESTAMP": "TIMESTAMP_US",
+}
+
+// qualifiedPath renders a QualifiedName's path: the full qualification
+// when it is deeper than catalog.schema, else the 3-argument constructor
+// (catalog, schema, name), dropping empty qualifiers; an empty name with
+// no qualification is the empty path.
+func qualifiedPath(catalog, schema string, quals []string, name string) []any {
+	path := []any{}
+	if len(quals) > 0 {
+		for _, q := range quals {
+			path = append(path, q)
+		}
+		return append(path, name)
+	}
+	if catalog != "" {
+		path = append(path, catalog)
+	}
+	if schema != "" {
+		path = append(path, schema)
+	}
+	if name == "" && len(path) == 0 {
+		return path
+	}
+	return append(path, name)
 }
 
 // ---- values ------------------------------------------------------------

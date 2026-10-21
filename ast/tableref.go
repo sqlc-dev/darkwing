@@ -31,8 +31,12 @@ func (a *AtClause) Children() []Node { return add(nil, a.Expr) }
 // BaseTableRef.
 type BaseTableRef struct {
 	tableRefBase
-	CatalogName     string    `json:"catalog_name,omitempty"`
-	SchemaName      string    `json:"schema_name,omitempty"`
+	CatalogName string `json:"catalog_name,omitempty"`
+	SchemaName  string `json:"schema_name,omitempty"`
+	// Qualification is the full qualification path when it is deeper
+	// than catalog.schema (a nested schema chain, DuckDB v2.0);
+	// CatalogName/SchemaName then hold QualifiedName::Catalog()/Schema().
+	Qualification   []string  `json:"qualification,omitempty"`
 	TableName       string    `json:"table_name"`
 	ColumnNameAlias []string  `json:"column_name_alias,omitempty"`
 	At              *AtClause `json:"at_clause,omitempty"`
@@ -200,6 +204,9 @@ type ShowRef struct {
 	TableName   string `json:"table_name,omitempty"`
 	CatalogName string `json:"catalog_name,omitempty"`
 	SchemaName  string `json:"schema_name,omitempty"`
+	// Qualification is the full qualification path of a nested name
+	// (see BaseTableRef.Qualification).
+	Qualification []string `json:"qualification,omitempty"`
 	// Query is set when describing a query (`DESCRIBE SELECT ...`).
 	Query    QueryNode `json:"query,omitempty"`
 	ShowType ShowType  `json:"show_type"`

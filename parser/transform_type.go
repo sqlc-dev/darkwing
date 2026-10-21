@@ -21,13 +21,25 @@ func (tc *transformContext) transformType(n tnode) *ast.TypeExpression {
 	for _, bound := range bounds {
 		base = tc.applyArrayBound(base, bound)
 	}
-	if len(bounds) == 0 {
+	if len(bounds) == 0 && base.Pos() < 0 {
+		// a SETOF inner type keeps its own (NestedType) location
 		base.SetSpan(n.span())
 	}
 	return base
 }
 
-// applyArrayBound wraps a type into list/array per one ArrayBounds entry.
+// NestedType <- TypeVariations ArrayBounds* — the element types of
+// STRUCT/UNION/MAP/TUPLE and SETOF (v2.0). Unlike Type it is a rule of its
+// own producing an expression, so an array wrapper takes the rule's
+// location (TransformNestedType).
+func (tc *transformContext) transformNestedType(n tnode) *ast.TypeExpression {
+	t := tc.transformType(n)
+	if t.Pos() < 0 {
+		t.SetSpan(n.span())
+	}
+	return t
+}
+
 // applyArrayBound wraps a type into list/array; the synthesized wrapper
 // carries no location (only named leaf types do).
 func (tc *transformContext) applyArrayBound(base *ast.TypeExpression, n tnode) *ast.TypeExpression {
@@ -52,19 +64,21 @@ func (tc *transformContext) squareBracketArray(base *ast.TypeExpression, n tnode
 		return typeExpr(sp, "list", base)
 	}
 	bound := tc.transformExpression(expr)
-	// the bound must be a constant; a constant integer is re-synthesized
-	// as a location-free BIGINT value, and negative sizes are a parser
-	// error upstream (non-integer constants fail at conversion, post-parse)
+	// the bound must be a constant INTEGER literal
+	// (TransformSquareBracketsArray); it is re-synthesized as a
+	// location-free ConstantExpression::Integer, and negative sizes are a
+	// parser error (non-integer literals raise a BinderException upstream
+	// — post-parse under the oracle's classification — so darkwing keeps
+	// the constant and accepts)
 	c, isConst := bound.(*ast.ConstantExpression)
 	if !isConst {
 		raise("Expected a constant number as array size")
 	}
-	if c.Value.Kind == ast.ValueInt64 {
-		if c.Value.Int64 < 0 {
+	if v, ok := literalInt64(c.Literal); ok {
+		if v < 0 {
 			raise("Array size must be greater than 0")
 		}
-		c.Value.Type = ast.LogicalType{ID: "BIGINT"}
-		c.SetSpan(invalidSpan)
+		bound = intConst(invalidSpan, v)
 	}
 	return typeExpr(sp, "array", base, bound)
 }
@@ -91,18 +105,19 @@ func (tc *transformContext) transformTypeVariation(n tnode) *ast.TypeExpression 
 	case "VariantType":
 		return typeExpr(sp, "VARIANT")
 	case "MapType":
-		// 'MAP' Parens(List(Type))?
+		// 'MAP' Parens(List(NestedType))?
 		var args []ast.Expr
 		if types, ok := alt.child(1).opt(); ok {
 			for _, t := range types.parens().listElems() {
-				args = append(args, tc.transformType(t))
+				args = append(args, tc.transformNestedType(t))
 			}
 		}
 		return typeExpr(sp, "MAP", args...)
 	case "TupleType":
 		var args []ast.Expr
+		// 'TUPLE' Parens(List(NestedType))
 		for _, t := range alt.child(1).parens().listElems() {
-			args = append(args, tc.transformType(t))
+			args = append(args, tc.transformNestedType(t))
 		}
 		return typeExpr(sp, "TUPLE", args...)
 	case "GeometryType":
@@ -120,8 +135,9 @@ func (tc *transformContext) transformTypeVariation(n tnode) *ast.TypeExpression 
 	case "NumericType":
 		return tc.transformNumericType(alt)
 	case "SetofType":
-		// SETOF is dropped at parse time; the inner type stands alone
-		return tc.transformType(alt.child(1))
+		// 'SETOF' NestedType: SETOF is dropped at parse time; the inner
+		// type stands alone
+		return tc.transformNestedType(alt.child(1))
 	case "SimpleType":
 		return tc.transformSimpleType(alt)
 	}
@@ -134,8 +150,8 @@ func (tc *transformContext) transformTypeVariation(n tnode) *ast.TypeExpression 
 func (tc *transformContext) transformColIdTypeList(n tnode) []ast.Expr {
 	var args []ast.Expr
 	for _, field := range n.parens().listElems() {
-		// ColIdType <- ColId Type
-		t := tc.transformType(field.child(1))
+		// ColIdType <- ColId NestedType
+		t := tc.transformNestedType(field.child(1))
 		t.Alias = identifierText(field.child(0))
 		args = append(args, t)
 	}
@@ -155,12 +171,26 @@ func (tc *transformContext) transformTimeType(n tnode) *ast.TypeExpression {
 		// a precision modifier picks the timestamp variant
 		if mods, ok := n.child(1).opt(); ok {
 			args := tc.transformTypeModifiers(mods)
+			if len(args) > 0 {
+				if tz, ok := n.child(2).opt(); ok {
+					if _, w := tz.child(0).sole().choice(); w.name() == "WithRule" {
+						raise("TIMESTAMP WITH TIME ZONE does not take a precision")
+					}
+				}
+			}
 			if len(args) > 1 {
 				raise("TIMESTAMP only supports a single modifier")
 			}
 			if len(args) == 1 {
-				if c, isConst := args[0].(*ast.ConstantExpression); isConst && c.Value.Kind == ast.ValueInt64 {
-					p := c.Value.Int64
+				c := args[0].(*ast.ConstantExpression)
+				if c.Literal.Kind == ast.LiteralNull {
+					raise("TIMESTAMP precision cannot be NULL")
+				}
+				p, isInt := literalInt64(c.Literal)
+				if !isInt {
+					raise("TIMESTAMP precision must be an integral type")
+				}
+				{
 					switch {
 					case p > 10:
 						raise("TIMESTAMP only supports until nano-second precision (9)")
@@ -237,7 +267,7 @@ func (tc *transformContext) transformNumericType(n tnode) *ast.TypeExpression {
 			// 'FLOAT' Parens(NumberLiteral)?
 			var args []ast.Expr
 			if mod, ok := t.child(1).opt(); ok {
-				args = append(args, numberConstant(mod.parens().span(), mod.parens().number()))
+				args = append(args, numberConstant(invalidSpan, mod.parens().number()))
 			}
 			return typeExpr(sp, "FLOAT", args...)
 		case "DecimalType", "DecType", "NumericModType":
@@ -281,13 +311,13 @@ func (tc *transformContext) transformSimpleType(n tnode) *ast.TypeExpression {
 		return typeExpr(sp, "VARCHAR", args...)
 	case "QualifiedSimpleType":
 		// QualifiedTypeName TypeModifiers?
-		catalog, schema, name := tc.transformQualifiedTypeName(alt.child(0))
+		qn, name := tc.transformQualifiedTypeNamePath(alt.child(0))
 		var args []ast.Expr
 		if mods, ok := alt.child(1).opt(); ok {
 			args = tc.transformTypeModifiers(mods)
 		}
 		t := typeExpr(sp, name, args...)
-		t.Catalog, t.Schema = catalog, schema
+		t.Catalog, t.Schema, t.Qualification = qn.catalog, qn.schema, qn.path
 		return t
 	}
 	shapeError(alt, "unknown simple type")
@@ -296,24 +326,33 @@ func (tc *transformContext) transformSimpleType(n tnode) *ast.TypeExpression {
 
 // QualifiedTypeName <- CatalogReservedSchemaTypeName /
 // SchemaReservedTypeName / TypeNameAsQualifiedName
-func (tc *transformContext) transformQualifiedTypeName(n tnode) (catalog, schema, name string) {
+// CatalogReservedSchemaTypeName <- CatalogQualification ReservedSchemaQualification+ ReservedTypeName
+func (tc *transformContext) transformQualifiedTypeNamePath(n tnode) (qualifiedName, string) {
 	_, alt := n.sole().choice()
+	var quals []string
+	var name string
 	switch alt.name() {
 	case "CatalogReservedSchemaTypeName":
-		catalog = identifierText(alt.child(0).child(0))
-		schema = identifierText(alt.child(1).child(0))
+		quals = append(quals, identifierText(alt.child(0).child(0)))
+		for _, sq := range alt.child(1).repeat() {
+			quals = append(quals, identifierText(sq.child(0)))
+		}
 		name = identifierText(alt.child(2))
 	case "SchemaReservedTypeName":
-		schema = identifierText(alt.child(0).child(0))
+		quals = append(quals, identifierText(alt.child(0).child(0)))
 		name = identifierText(alt.child(1))
 	case "TypeNameAsQualifiedName":
 		name = identifierText(alt.sole())
 	default:
 		shapeError(alt, "unknown qualified type name")
 	}
-	// a catalog with no schema is a schema qualification
-	if catalog != "" && schema == "" {
-		catalog, schema = "", catalog
-	}
-	return catalog, schema, name
+	return newQualifiedName(quals), name
+}
+
+// transformQualifiedTypeName returns QualifiedName::Catalog()/Schema()/
+// Name() of a QualifiedTypeName (see transformQualifiedTypeNamePath for
+// nested schema paths).
+func (tc *transformContext) transformQualifiedTypeName(n tnode) (catalog, schema, name string) {
+	qn, name := tc.transformQualifiedTypeNamePath(n)
+	return qn.catalog, qn.schema, name
 }

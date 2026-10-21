@@ -6,7 +6,6 @@ package parser
 import (
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/sqlc-dev/darkwing/ast"
 )
@@ -63,27 +62,66 @@ func (tc *transformContext) transformInnerTableRef(n tnode) ast.TableRef {
 	_, alt := n.sole().choice()
 	switch alt.name() {
 	case "ValuesRef":
-		// ValuesClause TableAlias? — a VALUES ref in FROM position is
-		// always wrapped in a subquery (SELECT * FROM valueslist), the
-		// alias landing on the wrapper
-		ref := tc.transformValuesClause(alt.child(0))
+		// TableAliasColon? ValuesClause TableAlias? SampleClause? — a
+		// VALUES ref in FROM position is always wrapped in a subquery
+		// (SELECT * FROM valueslist), the alias landing on the wrapper
+		ref := tc.transformValuesClause(alt.child(1))
 		ref.Alias = "valueslist"
 		sub := &ast.SubqueryRef{Subquery: &ast.SelectStatement{Node: starSelect(ref, invalidSpan)}}
 		sub.SetSpan(alt.span())
-		if aliasNode, ok := alt.child(1).opt(); ok {
+		colon, hasColon := alt.child(0).opt()
+		aliasNode, hasAlias := alt.child(2).opt()
+		var sample *ast.SampleOptions
+		if sc, ok := alt.child(3).opt(); ok {
+			sample = tc.transformSampleClause(sc)
+		}
+		if hasColon && hasAlias {
+			raise("Table reference cannot have two aliases")
+		}
+		if hasColon {
+			sub.Alias = identifierText(colon.child(0))
+		}
+		if hasAlias {
 			sub.Alias, sub.ColumnNameAlias = tc.transformTableAlias(aliasNode)
 		}
+		sub.Sample = sample
 		return sub
 	case "TableFunction":
 		return tc.transformTableFunction(alt)
 	case "TableSubquery":
-		// Lateral? SubqueryReference TableAlias? — the location covers only
-		// the parenthesized subquery, not the alias
-		ref := &ast.SubqueryRef{Subquery: tc.transformSelectInternalStatement(alt.child(1).sole().parens())}
-		ref.SetSpan(alt.child(1).span())
-		if aliasNode, ok := alt.child(2).opt(); ok {
-			ref.Alias, ref.ColumnNameAlias = tc.transformTableAlias(aliasNode)
+		// TableAliasColon? Lateral? SubqueryReference TableAlias?
+		// SampleClause? — the location covers only the parenthesized
+		// subquery, not the alias
+		subNode := alt.child(2)
+		ref := &ast.SubqueryRef{Subquery: tc.transformSelectInternalStatement(subNode.sole().parens())}
+		ref.SetSpan(subNode.span())
+		colon, hasColon := alt.child(0).opt()
+		_, lateral := alt.child(1).opt()
+		aliasNode, hasAlias := alt.child(3).opt()
+		var alias string
+		var colAliases []string
+		if hasAlias {
+			alias, colAliases = tc.transformTableAlias(aliasNode)
 		}
+		var sample *ast.SampleOptions
+		if sc, ok := alt.child(4).opt(); ok {
+			sample = tc.transformSampleClause(sc)
+		}
+		if hasColon && hasAlias {
+			// upstream renders the subquery with SubqueryRef::ToString;
+			// darkwing quotes its source text
+			raise("Table reference %s cannot have two aliases", tc.src[subNode.span().Start:subNode.span().End])
+		}
+		if lateral && sample != nil {
+			raise("TABLESAMPLE cannot be applied to a LATERAL subquery")
+		}
+		if hasColon {
+			ref.Alias = identifierText(colon.child(0))
+		}
+		if hasAlias {
+			ref.Alias, ref.ColumnNameAlias = alias, colAliases
+		}
+		ref.Sample = sample
 		return ref
 	case "BaseTableRef":
 		return tc.transformBaseTableRef(alt)
@@ -208,16 +246,26 @@ func (tc *transformContext) transformBaseTableRef(n tnode) ast.TableRef {
 // fillBaseTableName fills catalog/schema/table from a BaseTableName node.
 // BaseTableName <- QualifiedTableName / UnqualifiedBaseTableName
 // QualifiedTableName <- CatalogReservedSchemaTable / SchemaReservedTable
+// CatalogReservedSchemaTable <- CatalogQualification ReservedSchemaQualification+ ReservedTableName
 func (tc *transformContext) fillBaseTableName(ref *ast.BaseTableRef, n tnode) {
 	_, alt := n.sole().choice()
 	if alt.name() == "QualifiedTableName" {
 		_, alt = alt.sole().choice()
 	}
+	tc.fillTableNameAlt(ref, alt)
+}
+
+// fillTableNameAlt fills a ref from one BaseTableName/QualifiedTableName
+// alternative.
+func (tc *transformContext) fillTableNameAlt(ref *ast.BaseTableRef, alt tnode) {
 	switch alt.name() {
 	case "CatalogReservedSchemaTable":
-		// CatalogQualification ReservedSchemaQualification+ ReservedTableName
-		ref.CatalogName = identifierText(alt.child(0).child(0))
-		ref.SchemaName = lastSchemaQualification(alt.child(1))
+		quals := []string{identifierText(alt.child(0).child(0))}
+		for _, sq := range alt.child(1).repeat() {
+			quals = append(quals, identifierText(sq.child(0)))
+		}
+		qn := newQualifiedName(quals)
+		ref.CatalogName, ref.SchemaName, ref.Qualification = qn.catalog, qn.schema, qn.path
 		ref.TableName = identifierText(alt.child(2))
 	case "SchemaReservedTable":
 		ref.SchemaName = identifierText(alt.child(0).child(0))
@@ -229,36 +277,39 @@ func (tc *transformContext) fillBaseTableName(ref *ast.BaseTableRef, n tnode) {
 	}
 }
 
-// lastSchemaQualification reads a ReservedSchemaQualification+ repetition.
-// Upstream (v2.0) keeps the whole nested schema path in its QualifiedName,
-// whose Schema() is the component directly before the name; darkwing's
-// three-part names keep that last component.
-func lastSchemaQualification(n tnode) string {
-	items := n.repeat()
-	return identifierText(items[len(items)-1].child(0))
-}
-
-// transformQualifiedNameParts splits a QualifiedName rule node.
+// transformQualifiedNameParts splits a QualifiedName rule node into
+// QualifiedName::Catalog()/Schema()/Name(); a nested schema chain keeps
+// its first component as the catalog and its last as the schema (use
+// transformQualifiedNamePath for the full path).
 // QualifiedName <- CatalogReservedSchemaIdentifier /
 // SchemaReservedIdentifierOrStringLiteral / IdentifierOrStringLiteral
 func (tc *transformContext) transformQualifiedNameParts(n tnode) (catalog, schema, name string) {
+	quals, name := tc.transformQualifiedNamePath(n)
+	qn := newQualifiedName(quals)
+	return qn.catalog, qn.schema, name
+}
+
+// transformQualifiedNamePath returns a QualifiedName rule node's
+// qualification path (catalog, schemas...) and name.
+// CatalogReservedSchemaIdentifier <- CatalogQualification ReservedSchemaQualification+ ReservedIdentifierOrStringLiteral
+func (tc *transformContext) transformQualifiedNamePath(n tnode) (quals []string, name string) {
 	_, alt := n.sole().choice()
 	switch alt.name() {
 	case "CatalogReservedSchemaIdentifier":
-		// CatalogQualification ReservedSchemaQualification+
-		// ReservedIdentifierOrStringLiteral
-		catalog = identifierText(alt.child(0).child(0))
-		schema = lastSchemaQualification(alt.child(1))
+		quals = append(quals, identifierText(alt.child(0).child(0)))
+		for _, sq := range alt.child(1).repeat() {
+			quals = append(quals, identifierText(sq.child(0)))
+		}
 		name = identifierText(alt.child(2))
 	case "SchemaReservedIdentifierOrStringLiteral":
-		schema = identifierText(alt.child(0).child(0))
+		quals = append(quals, identifierText(alt.child(0).child(0)))
 		name = identifierText(alt.child(1))
 	case "IdentifierOrStringLiteral":
 		name = identifierText(alt)
 	default:
 		shapeError(alt, "unknown qualified name")
 	}
-	return catalog, schema, name
+	return quals, name
 }
 
 // TableAlias <- TableAliasAs / TableAliasWithoutAs
@@ -324,10 +375,13 @@ func (tc *transformContext) transformTableFunction(n tnode) ast.TableRef {
 	var qualified, args, ordinality tnode
 	switch alt.name() {
 	case "TableFunctionLateralOpt":
-		// Lateral? QualifiedTableFunction TableFunctionArguments WithOrdinality? TableAlias?
+		// Lateral? QualifiedTableFunction TableFunctionArguments WithOrdinality? TableAlias? SampleClause?
 		qualified, args, ordinality = alt.child(1), alt.child(2), alt.child(3)
 		if aliasNode, ok := alt.child(4).opt(); ok {
 			ref.Alias, ref.ColumnNameAlias = tc.transformTableAlias(aliasNode)
+		}
+		if sc, ok := alt.child(5).opt(); ok {
+			ref.Sample = tc.transformSampleClause(sc)
 		}
 	case "TableFunctionAliasColon":
 		// TableAliasColon QualifiedTableFunction TableFunctionArguments WithOrdinality? SampleClause?
@@ -343,6 +397,9 @@ func (tc *transformContext) transformTableFunction(n tnode) ast.TableRef {
 		ref.WithOrdinality = true
 	}
 	fn := tc.qualifiedFunctionExpr(qualified, args)
+	if _, lateral := alt.child(0).opt(); lateral && alt.name() == "TableFunctionLateralOpt" && ref.Sample != nil {
+		raise("TABLESAMPLE cannot be applied to a LATERAL table function")
+	}
 	// values(...) is a VALUES list, wrapped like any FROM-position VALUES
 	if fn.FunctionName == "values" && fn.Schema == "" && fn.Catalog == "" {
 		el := &ast.ExpressionListRef{}
@@ -364,20 +421,13 @@ func (tc *transformContext) transformTableFunction(n tnode) ast.TableRef {
 
 // qualifiedFunctionExpr builds the call expression for a qualified table
 // function plus its argument list (shared by table functions and CALL).
-// QualifiedTableFunction <- CatalogQualification? SchemaQualification? TableFunctionName
+// QualifiedTableFunction <- CatalogQualification? SchemaQualification* TableFunctionName
 // TableFunctionArguments <- Parens(List(FunctionArgument)?)
 func (tc *transformContext) qualifiedFunctionExpr(qualified, args tnode) *ast.FunctionExpression {
 	fn := &ast.FunctionExpression{}
 	fn.SetSpan(invalidSpan)
-	if cq, ok := qualified.child(0).opt(); ok {
-		fn.Catalog = identifierText(cq.child(0))
-	}
-	if sq, ok := qualified.child(1).opt(); ok {
-		fn.Schema = identifierText(sq.child(0))
-	}
-	if fn.Catalog != "" && fn.Schema == "" {
-		fn.Catalog, fn.Schema = "", fn.Catalog
-	}
+	qn := qualifiedTableFunction(qualified)
+	fn.Catalog, fn.Schema, fn.Qualification = qn.catalog, qn.schema, qn.path
 	fn.FunctionName = strings.ToLower(identifierText(qualified.child(2)))
 	if list, ok := args.sole().parens().opt(); ok {
 		for _, a := range list.listElems() {
@@ -385,6 +435,20 @@ func (tc *transformContext) qualifiedFunctionExpr(qualified, args tnode) *ast.Fu
 		}
 	}
 	return fn
+}
+
+// qualifiedTableFunction ports TransformQualifiedTableFunction:
+// CatalogQualification? SchemaQualification* TableFunctionName, the
+// qualifiers forming one QualifiedName path.
+func qualifiedTableFunction(qualified tnode) qualifiedName {
+	var quals []string
+	if cq, ok := qualified.child(0).opt(); ok {
+		quals = append(quals, identifierText(cq.child(0)))
+	}
+	for _, sq := range qualified.child(1).repeat() {
+		quals = append(quals, identifierText(sq.child(0)))
+	}
+	return newQualifiedName(quals)
 }
 
 // ---- joins -------------------------------------------------------------
@@ -525,9 +589,10 @@ func (tc *transformContext) transformNearestJoin(left ast.TableRef, n tnode) ast
 		join.NearestApprox = kind.name() == "NearestApprox"
 	}
 	if num, ok := alt.child(5).opt(); ok {
-		v, err := strconv.ParseInt(num.number(), 10, 64)
-		if err != nil || v <= 0 {
-			raise("NEAREST expects a positive integer literal, got \"%s\"", num.number())
+		lit := numberLiteral(num.number())
+		v, ok := literalInt64(lit)
+		if !ok || v < 1 {
+			raise("NEAREST expects a positive integer literal, got \"%s\"", valueString(literalValue(lit)))
 		}
 		join.NearestCount = v
 	}
@@ -554,16 +619,8 @@ func (tc *transformContext) transformNearestBareRef(n tnode) ast.TableRef {
 		ref.SetSpan(alt.span())
 		qualified := alt.child(1)
 		fn := &ast.FunctionExpression{FunctionName: strings.ToLower(identifierText(qualified.child(2)))}
-		if cq, ok := qualified.child(0).opt(); ok {
-			fn.Schema = identifierText(cq.child(0))
-		}
-		if sq, ok := qualified.child(1).opt(); ok {
-			if fn.Schema != "" {
-				fn.Catalog, fn.Schema = fn.Schema, identifierText(sq.child(0))
-			} else {
-				fn.Schema = identifierText(sq.child(0))
-			}
-		}
+		qn := qualifiedTableFunction(qualified)
+		fn.Catalog, fn.Schema, fn.Qualification = qn.catalog, qn.schema, qn.path
 		if list, ok := alt.child(2).sole().parens().opt(); ok {
 			for _, a := range list.listElems() {
 				fn.Arguments = append(fn.Arguments, tc.transformFunctionArgument(a))
@@ -616,7 +673,8 @@ func (tc *transformContext) transformTablePivot(left ast.TableRef, n tnode) ast.
 		ref.Pivots = append(ref.Pivots, tc.transformPivotValueList(pv, true))
 	}
 	if gb, ok := body.child(3).opt(); ok {
-		ref.GroupBy = identifierList(gb.child(2))
+		// PivotGroupByList <- 'GROUP' 'BY' OptionalParensNameList
+		ref.GroupBy = optionalParensNameList(gb.child(2))
 	}
 	if aliasNode, ok := n.child(2).opt(); ok {
 		ref.Alias, ref.ColumnNameAlias = tc.transformTableAlias(aliasNode)
@@ -650,70 +708,57 @@ func (tc *transformContext) transformPivotValueList(n tnode, expandHeader bool) 
 	return col
 }
 
-// pivotEntry converts one aliased expression into a pivot IN-list entry:
-// constants keep their value, a bare column name is stringified (PIVOT
-// ... IN (c) pivots on the value "c"), anything else stays an expression.
+// pivotEntry converts one aliased expression into a pivot IN-list entry
+// (TransformPivotTargetList / TransformPivotInList): a bare column name
+// is stringified (PIVOT ... IN (c) pivots on the value "c"), as is a
+// non-empty row(...) of bare column names; since v2.0 constants and
+// everything else stay expressions, folded by the binder.
 func (tc *transformContext) pivotEntry(n tnode) ast.PivotColumnEntry {
 	expr := tc.transformAliasedExpression(n)
+	// the expression keeps its alias (TransformPivotTargetList)
 	entry := ast.PivotColumnEntry{Alias: expr.GetAlias()}
-	expr.SetAlias("")
-	parts := rowParts(expr)
-	values := make([]ast.Value, 0, len(parts))
-	for _, part := range parts {
-		switch e := part.(type) {
-		case *ast.ConstantExpression:
-			values = append(values, e.Value)
-		case *ast.ColumnRefExpression:
-			if len(e.ColumnNames) == 1 {
-				values = append(values, ast.Value{Type: ast.LogicalType{ID: "VARCHAR"}, Kind: ast.ValueString, Str: e.ColumnNames[0]})
-				continue
-			}
-		case *ast.CastExpression:
-			// fold constant casts: integer casts of integer constants
-			// (`1::INT`) and ISO dates (`'2022-01-01'::DATE`)
-			if c, isConst := e.Child.(*ast.ConstantExpression); isConst && e.CastType != nil &&
-				e.CastType.Schema == "" && len(e.CastType.Args) == 0 {
-				if id, isInt := integerTypeNames[e.CastType.TypeName]; isInt && c.Value.Kind == ast.ValueInt64 {
-					v := c.Value
-					v.Type = ast.LogicalType{ID: id}
-					values = append(values, v)
-					continue
-				}
-				if e.CastType.TypeName == "DATE" && c.Value.Kind == ast.ValueString {
-					if days, ok := isoDateToDays(c.Value.Str); ok {
-						values = append(values, ast.Value{Type: ast.LogicalType{ID: "DATE"}, Kind: ast.ValueInt64, Int64: days})
-						continue
-					}
-				}
-			}
-		}
-	}
-	if len(values) == len(parts) {
+	if values, ok := pivotInListValues(expr); ok && len(values) > 0 {
 		entry.Values = values
 	} else {
-		// any unfoldable part keeps the whole entry as an expression
 		entry.StarExpr = expr
 	}
 	return entry
 }
 
-// isoDateToDays parses a YYYY-MM-DD date into days since 1970-01-01.
-func isoDateToDays(s string) (int64, bool) {
-	t, err := time.Parse("2006-01-02", s)
-	if err != nil {
-		return 0, false
+// pivotInListValues ports TransformPivotInList's folding.
+func pivotInListValues(e ast.Expr) ([]ast.Value, bool) {
+	switch x := e.(type) {
+	case *ast.ColumnRefExpression:
+		if len(x.ColumnNames) != 1 {
+			raise("PIVOT IN list cannot contain qualified column references")
+		}
+		return []ast.Value{varcharValue(x.ColumnNames[0])}, true
+	case *ast.FunctionExpression:
+		if x.FunctionName != "row" || len(x.Arguments) == 0 {
+			return nil, false
+		}
+		var values []ast.Value
+		for _, a := range x.Arguments {
+			v, ok := pivotInListValues(a.Expr)
+			if !ok {
+				return nil, false
+			}
+			values = append(values, v...)
+		}
+		return values, true
 	}
-	return int64(t.Unix() / 86400), true
+	return nil, false
 }
 
-// integerTypeNames maps unbound integer type spellings to logical type
-// ids (used to fold constant casts in pivot IN entries).
-var integerTypeNames = map[string]string{
-	"INTEGER":  "INTEGER",
-	"BIGINT":   "BIGINT",
-	"SMALLINT": "SMALLINT",
-	"TINYINT":  "TINYINT",
-	"HUGEINT":  "HUGEINT",
+// optionalParensNameList transforms OptionalParensNameList <-
+// ParenthesizedNameList / BareNameList (both List(ColIdOrString), the
+// first parenthesized).
+func optionalParensNameList(n tnode) []string {
+	_, alt := n.sole().choice()
+	if alt.name() == "ParenthesizedNameList" {
+		return identifierList(alt.sole().parens())
+	}
+	return identifierList(alt.sole())
 }
 
 // rowParts flattens a row(...) constructor into its parts (multi-column
@@ -798,6 +843,13 @@ func (tc *transformContext) transformUnpivotHeader(n tnode) []string {
 func (tc *transformContext) transformPivotStatement(n tnode) ast.QueryNode {
 	ref := &ast.PivotRef{Source: tc.transformTableRef(n.child(1))}
 	ref.SetSpan(invalidSpan)
+	_, hasOn := n.child(2).opt()
+	_, hasUsing := n.child(3).opt()
+	_, hasGroup := n.child(4).opt()
+	if !hasOn && !hasUsing && !hasGroup {
+		// FinalizePivotStatementTrampoline (v2.0)
+		raise("PIVOT requires an ON, USING or GROUP BY clause")
+	}
 	if on, ok := n.child(2).opt(); ok {
 		// PivotOn <- 'ON' PivotColumnList
 		for _, e := range on.child(1).sole().listElems() {
@@ -823,6 +875,9 @@ func (tc *transformContext) transformPivotStatement(n tnode) ast.QueryNode {
 		// matching upstream's transform order.
 		for _, col := range ref.Pivots {
 			if col.PivotEnum == "" && len(col.Entries) == 0 && len(col.PivotExpressions) > 0 {
+				if tc.pivotEntries == 0 {
+					tc.pivotFirstColumn = tc.exprText(col.PivotExpressions[0])
+				}
 				tc.pivotEntries++
 				if tc.paramCount > 0 || tc.hasNamed || tc.hasPosition {
 					tc.pivotEntryHasParams = true
@@ -836,7 +891,7 @@ func (tc *transformContext) transformPivotStatement(n tnode) ast.QueryNode {
 		}
 	}
 	if gb, ok := n.child(4).opt(); ok {
-		ref.GroupBy = identifierList(gb.child(2))
+		ref.GroupBy = optionalParensNameList(gb.child(2))
 	}
 	if len(ref.Pivots) > 0 && len(ref.Aggregates) == 0 {
 		// pivots without USING default to count_star()
@@ -925,6 +980,20 @@ func (tc *transformContext) exprSourceText(e ast.Expr) string {
 	return constantText(e)
 }
 
+// exprText renders an expression for an error message: a column
+// reference as ColumnRefExpression::ToString (SQLIdentifier parts), any
+// other expression via its source text (exprSourceText).
+func (tc *transformContext) exprText(e ast.Expr) string {
+	if ref, ok := e.(*ast.ColumnRefExpression); ok {
+		parts := make([]string, len(ref.ColumnNames))
+		for i, p := range ref.ColumnNames {
+			parts[i] = sqlIdentifier(p)
+		}
+		return strings.Join(parts, ".")
+	}
+	return tc.exprSourceText(e)
+}
+
 // PivotColumnEntry <- PivotColumnSubquery / PivotValueList / PivotColumnExpression
 func (tc *transformContext) transformPivotColumnEntry(n tnode) ast.PivotColumn {
 	_, alt := n.sole().choice()
@@ -953,9 +1022,9 @@ func (tc *transformContext) transformUnpivotStatement(n tnode) ast.QueryNode {
 		col.Entries = append(col.Entries, tc.unpivotEntry(e))
 	}
 	if into, ok := n.child(4).opt(); ok {
-		// IntoNameValues <- 'INTO' 'NAME' ColIdOrString ValueOrValues List(Identifier)
+		// IntoNameValues <- 'INTO' 'NAME' ColIdOrString ValueOrValues OptionalParensNameList
 		col.UnpivotNames = []string{identifierText(into.child(2))}
-		ref.UnpivotNames = identifierList(into.child(4))
+		ref.UnpivotNames = optionalParensNameList(into.child(4))
 	} else {
 		col.UnpivotNames = []string{"name"}
 		ref.UnpivotNames = []string{"value"}

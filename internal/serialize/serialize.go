@@ -365,17 +365,36 @@ func tableRef(r ast.TableRef) map[string]any {
 	case *ast.ShowRef:
 		return locate(map[string]any{
 			"type": "SHOW_REF", "alias": ref.Alias, "sample": sampleOptions(ref.Sample),
-			"table_name":   ref.TableName,
-			"query":        queryNode(ref.Query),
-			"show_type":    string(ref.ShowType),
-			"catalog_name": ref.CatalogName,
-			"schema_name":  ref.SchemaName,
-			"qualified_name": map[string]any{
-				"path": qualifiedPath(ref.CatalogName, ref.SchemaName, ref.Qualification, ref.TableName),
-			},
+			"table_name":     ref.TableName,
+			"query":          queryNode(ref.Query),
+			"show_type":      string(ref.ShowType),
+			"catalog_name":   ref.CatalogName,
+			"schema_name":    ref.SchemaName,
+			"qualified_name": showRefPath(ref),
 		}, ref.Span)
 	}
 	panic(fmt.Sprintf("serialize: unknown table ref %T", r))
+}
+
+// showRefPath renders a ShowRef's v2.0 QualifiedName: the components
+// present (SHOW TABLES FROM keeps an empty table name), empty for a
+// query-only ShowRef.
+func showRefPath(ref *ast.ShowRef) map[string]any {
+	path := []any{}
+	if len(ref.Qualification) > 0 {
+		// a nested schema chain keeps its full path
+		return map[string]any{"path": qualifiedPath("", "", ref.Qualification, ref.TableName)}
+	}
+	if ref.ShowType == ast.ShowTypeShowFrom || ref.TableName != "" || ref.SchemaName != "" {
+		if ref.CatalogName != "" {
+			path = append(path, ref.CatalogName)
+		}
+		if ref.SchemaName != "" {
+			path = append(path, ref.SchemaName)
+		}
+		path = append(path, ref.TableName)
+	}
+	return map[string]any{"path": path}
 }
 
 // qualifiedColumnName renders a dotted column path the way upstream

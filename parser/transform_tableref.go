@@ -252,6 +252,12 @@ func (tc *transformContext) fillBaseTableName(ref *ast.BaseTableRef, n tnode) {
 	if alt.name() == "QualifiedTableName" {
 		_, alt = alt.sole().choice()
 	}
+	tc.fillTableNameAlt(ref, alt)
+}
+
+// fillTableNameAlt fills a ref from one BaseTableName/QualifiedTableName
+// alternative.
+func (tc *transformContext) fillTableNameAlt(ref *ast.BaseTableRef, alt tnode) {
 	switch alt.name() {
 	case "CatalogReservedSchemaTable":
 		quals := []string{identifierText(alt.child(0).child(0))}

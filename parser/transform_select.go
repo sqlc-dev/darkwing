@@ -775,136 +775,176 @@ var specialShowNames = map[string]bool{
 }
 
 // DescribeStatement <- ShowTables / ShowDeprecatedSelect / DescribeSelect /
-// ShowAllTables / ShowByName / DescribeByName (port of transform_describe.cpp)
-// All SHOW/DESCRIBE desugaring uses synthesized (location-free) nodes,
-// mirroring upstream.
+// ShowAllTables / ShowByName / DescribeByName
+// Port of transformer/transform_describe.cpp. All SHOW/DESCRIBE
+// desugaring uses synthesized (location-free) nodes, mirroring upstream.
 func (tc *transformContext) transformDescribe(n tnode) ast.QueryNode {
 	_, alt := n.sole().choice()
-	ref := &ast.ShowRef{ShowType: ast.ShowTypeDescribe}
+	ref := &ast.ShowRef{}
 	ref.SetSpan(invalidSpan)
 	switch alt.name() {
+	case "ShowDeprecatedSelect":
+		// ShowRule SelectStatementInternal
+		ref.ShowType = ast.ShowTypeShow
+		ref.Query = tc.transformSelectInternal(alt.child(1))
 	case "DescribeSelect":
 		// DescribeOrSummarize SelectStatementInternal
-		ref.ShowType = describeOrSummarizeType(alt.child(0))
-		ref.Query = tc.transformSelectInternal(alt.child(1))
-	case "ShowDeprecatedSelect":
-		// ShowRule SelectStatementInternal (deprecated SHOW (query))
-		ref.ShowType = ast.ShowTypeShow
+		ref.ShowType = describeOrSummarize(alt.child(0))
 		ref.Query = tc.transformSelectInternal(alt.child(1))
 	case "ShowAllTables":
 		setShowAllTables(ref)
 	case "ShowByName":
-		// ShowRule ShowTarget? — BuildShowByName: settings-first
+		// ShowRule ShowTarget?
 		ref.ShowType = ast.ShowTypeShow
-		target, ok := alt.child(1).opt()
-		if !ok {
-			setShowAllTables(ref)
-			break
-		}
-		_, t := target.sole().choice()
-		switch t.name() {
-		case "ShowDeprecatedQualifiedTableName":
-			// "SHOW cat.tbl" (deprecated) records the name and describes
-			// the table via a query
-			btr := &ast.BaseTableRef{}
-			btr.SetSpan(invalidSpan)
-			tc.fillBaseTableName(btr, t)
-			ref.CatalogName, ref.SchemaName, ref.TableName = btr.CatalogName, btr.SchemaName, btr.TableName
-			ref.Qualification = btr.Qualification
-			ref.Query = starSelect(btr, invalidSpan)
-		case "ShowSettingName":
-			name := identifierText(t.sole())
-			if !trySetSpecialShowForm(ref, name) {
-				ref.TableName = name
-			}
-		case "DescribeStringLiteral":
-			ref.TableName = tc.describeStringLiteral(t)
-		case "ShowSpecialForm":
-			// only reachable for autocomplete upstream (the identifier
-			// alternative matches first); handled like the setting name
-			trySetSpecialShowForm(ref, identifierText(t.sole()))
-		default:
-			shapeError(t, "unknown SHOW target")
-		}
+		tc.buildShowByName(ref, alt.child(1))
 	case "DescribeByName":
-		// DescribeOrSummarize DescribeTarget? — BuildDescribeByName
-		ref.ShowType = describeOrSummarizeType(alt.child(0))
-		target, ok := alt.child(1).opt()
-		if !ok {
-			if ref.ShowType == ast.ShowTypeSummary {
-				raise("Expected table name with SUMMARIZE")
-			}
-			setShowAllTables(ref)
-			break
-		}
-		_, t := target.sole().choice()
-		switch t.name() {
-		case "DescribeBaseTableName":
-			btr := &ast.BaseTableRef{}
-			btr.SetSpan(invalidSpan)
-			tc.fillBaseTableName(btr, t.sole())
-			if btr.CatalogName == "" && btr.SchemaName == "" && trySetSpecialShowForm(ref, btr.TableName) {
-				break
-			}
-			// DESCRIBE/SUMMARIZE t wraps the relation as SELECT * FROM t
-			ref.Query = starSelect(btr, invalidSpan)
-		case "DescribeStringLiteral":
-			// the string names the table directly
-			ref.TableName = tc.describeStringLiteral(t)
-		default:
-			shapeError(t, "unknown DESCRIBE target")
-		}
+		// DescribeOrSummarize DescribeTarget?
+		ref.ShowType = describeOrSummarize(alt.child(0))
+		tc.buildDescribeByName(ref, alt.child(1))
 	case "ShowTables":
 		// ShowOrDescribe 'TABLES' 'FROM' QualifiedName
 		ref.ShowType = ast.ShowTypeShowFrom
 		cat, schema, name := tc.transformQualifiedNameParts(alt.child(3))
-		if cat == "" && schema == "" {
-			schema = name
-		} else if cat == "" {
-			cat, schema = schema, name
+		if cat != "" {
+			raise("Expected \"SHOW TABLES FROM database\", \"SHOW TABLES FROM schema\", or " +
+				"\"SHOW TABLES FROM database.schema\"")
 		}
-		ref.CatalogName, ref.SchemaName = cat, schema
+		if schema == "" {
+			ref.SchemaName = name
+		} else {
+			ref.CatalogName, ref.SchemaName = schema, name
+		}
 	default:
 		shapeError(alt, "unknown describe statement")
 	}
 	return starSelect(ref, invalidSpan)
 }
 
-// setShowAllTables ports SetShowAllTables: the "list all tables" form
-// (bare SHOW/DESCRIBE, SHOW ALL TABLES).
+// describeOrSummarize maps DescribeOrSummarize <- DescribeRule / Summarize.
+func describeOrSummarize(n tnode) ast.ShowType {
+	if _, alt := n.sole().choice(); alt.name() == "Summarize" {
+		return ast.ShowTypeSummary
+	}
+	return ast.ShowTypeDescribe
+}
+
+// setShowAllTables configures the "list all tables" form (bare
+// SHOW/DESCRIBE and SHOW ALL TABLES).
 func setShowAllTables(ref *ast.ShowRef) {
 	ref.TableName = "__show_tables_expanded"
 	ref.ShowType = ast.ShowTypeShowSpecial
 }
 
-// trySetSpecialShowForm ports TrySetSpecialShowForm for an unqualified
-// name: SHOW/DESCRIBE DATABASES|SCHEMAS|TABLES|VARIABLES.
-func trySetSpecialShowForm(ref *ast.ShowRef, name string) bool {
-	lower := strings.ToLower(name)
-	if !specialShowNames[lower] {
+// describeTarget is upstream's DescribeTarget: a string-literal table
+// name, a relation, or nothing.
+type describeTarget struct {
+	isTableName bool
+	tableName   string
+	table       *ast.BaseTableRef
+}
+
+// transformDescribeTarget maps the target alternatives shared by
+// ShowTarget and DescribeTarget.
+func (tc *transformContext) transformDescribeTarget(alt tnode) describeTarget {
+	switch alt.name() {
+	case "DescribeBaseTableName", "ShowDeprecatedQualifiedTableName":
+		btr := &ast.BaseTableRef{}
+		btr.SetSpan(invalidSpan)
+		inner := alt.sole()
+		if inner.name() == "QualifiedTableName" {
+			// fillBaseTableName expects a BaseTableName-shaped choice
+			_, q := inner.sole().choice()
+			tc.fillQualifiedTable(btr, q)
+		} else {
+			tc.fillBaseTableName(btr, inner)
+		}
+		return describeTarget{table: btr}
+	case "ShowSettingName":
+		// a bare name: tried as a setting first, then as a table
+		btr := &ast.BaseTableRef{TableName: identifierText(alt)}
+		btr.SetSpan(invalidSpan)
+		return describeTarget{table: btr}
+	case "DescribeStringLiteral":
+		s := identifierText(alt)
+		if s == "" {
+			raise("Expected a table name, but got an empty string")
+		}
+		return describeTarget{isTableName: true, tableName: s}
+	case "ShowSpecialForm":
+		// keyword-only alternative: no target (autocomplete aid)
+		return describeTarget{}
+	}
+	shapeError(alt, "unknown describe target")
+	return describeTarget{}
+}
+
+// fillQualifiedTable fills a ref from a QualifiedTableName alternative
+// (CatalogReservedSchemaTable / SchemaReservedTable).
+func (tc *transformContext) fillQualifiedTable(ref *ast.BaseTableRef, alt tnode) {
+	tc.fillTableNameAlt(ref, alt)
+}
+
+// trySetSpecialShowForm ports TrySetSpecialShowForm: an unqualified
+// DATABASES/SCHEMAS/TABLES/VARIABLES target is a special form.
+func trySetSpecialShowForm(ref *ast.ShowRef, rel *ast.BaseTableRef) bool {
+	if rel.SchemaName != "" {
 		return false
 	}
-	ref.TableName = "\"" + lower + "\""
+	name := strings.ToLower(rel.TableName)
+	if !specialShowNames[name] {
+		return false
+	}
+	ref.TableName = "\"" + name + "\""
 	ref.ShowType = ast.ShowTypeShowSpecial
 	return true
 }
 
-// describeStringLiteral ports TransformDescribeStringLiteral.
-func (tc *transformContext) describeStringLiteral(n tnode) string {
-	s, _ := n.sole().stringLit()
-	if s == "" {
-		raise("Expected a table name, but got an empty string")
+// buildShowByName ports BuildShowByName (SHOW is settings-first).
+func (tc *transformContext) buildShowByName(ref *ast.ShowRef, targetNode tnode) {
+	var target describeTarget
+	if t, ok := targetNode.opt(); ok {
+		_, alt := t.sole().choice()
+		target = tc.transformDescribeTarget(alt)
 	}
-	return s
+	switch {
+	case !target.isTableName && target.table == nil:
+		// bare SHOW lists all tables
+		setShowAllTables(ref)
+	case target.isTableName:
+		ref.TableName = target.tableName
+	case trySetSpecialShowForm(ref, target.table):
+	case target.table.SchemaName != "":
+		// SHOW cat.tbl (deprecated) describes the table via a query
+		ref.CatalogName = target.table.CatalogName
+		ref.SchemaName = target.table.SchemaName
+		ref.TableName = target.table.TableName
+		ref.Qualification = target.table.Qualification
+		ref.Query = starSelect(target.table, invalidSpan)
+	default:
+		ref.TableName = target.table.TableName
+	}
 }
 
-// describeOrSummarizeType maps DescribeOrSummarize <- DescribeRule / Summarize.
-func describeOrSummarizeType(n tnode) ast.ShowType {
-	_, alt := n.sole().choice()
-	if alt.name() == "Summarize" {
-		return ast.ShowTypeSummary
+// buildDescribeByName ports BuildDescribeByName (DESCRIBE/SUMMARIZE always
+// describe a relation or query).
+func (tc *transformContext) buildDescribeByName(ref *ast.ShowRef, targetNode tnode) {
+	var target describeTarget
+	if t, ok := targetNode.opt(); ok {
+		_, alt := t.sole().choice()
+		target = tc.transformDescribeTarget(alt)
 	}
-	return ast.ShowTypeDescribe
+	switch {
+	case !target.isTableName && target.table == nil:
+		if ref.ShowType == ast.ShowTypeSummary {
+			raise("Expected table name with SUMMARIZE")
+		}
+		setShowAllTables(ref)
+	case target.isTableName:
+		ref.TableName = target.tableName
+	case trySetSpecialShowForm(ref, target.table):
+	default:
+		ref.Query = starSelect(target.table, invalidSpan)
+	}
 }
 
 // ---- samples -----------------------------------------------------------

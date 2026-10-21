@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/sqlc-dev/darkwing/ast"
+	"github.com/sqlc-dev/darkwing/token"
 )
 
 func init() {
@@ -34,11 +35,12 @@ func (tc *transformContext) transformCreate(n tnode) ast.Stmt {
 	if _, orReplace := n.child(1).opt(); orReplace {
 		onConflict = ast.CreateReplace
 	}
-	temporary := false
+	temporary, persistent := false, false
 	if temp, ok := n.child(2).opt(); ok {
 		// Temporary <- Persistent / TempPersistent / TemporaryPersistent
 		_, kind := temp.sole().choice()
 		temporary = kind.name() != "Persistent"
+		persistent = !temporary
 	}
 	_, variation := n.child(3).sole().choice()
 	var info ast.CreateInfo
@@ -78,6 +80,19 @@ func (tc *transformContext) transformCreate(n tnode) ast.Stmt {
 			}
 		}
 	}
+	// TransformCreateStatement: PERSISTENT only applies to secrets, and
+	// TEMPORARY is rejected for entries that derive it from their table
+	if persistent && variation.name() != "CreateSecretStmt" {
+		raise("PERSISTENT is only supported for CREATE SECRET")
+	}
+	if temporary {
+		switch variation.name() {
+		case "CreateIndexStmt":
+			raise("Temporary indexes are not supported")
+		case "CreateTriggerStmt":
+			raise("Temporary triggers are not supported")
+		}
+	}
 	stmt.Info = info
 	return stmt
 }
@@ -111,6 +126,9 @@ func (tc *transformContext) transformCreateTable(n tnode) ast.CreateInfo {
 		if ids, ok := def.child(0).opt(); ok {
 			info.QueryAliases = identifierList(ids.sole().parens())
 		}
+		if wl, ok := def.child(2).opt(); ok {
+			info.Options = tc.transformWithList(wl)
+		}
 		stmt := tc.transformStatement(def.child(4))
 		sel, ok := stmt.(*ast.SelectStatement)
 		if !ok {
@@ -124,10 +142,75 @@ func (tc *transformContext) transformCreateTable(n tnode) ast.CreateInfo {
 				tc.transformCreateTableElement(info, elem)
 			}
 		}
+		if wl, ok := def.child(2).opt(); ok {
+			info.Options = tc.transformWithList(wl)
+		}
+		if len(info.Columns) == 0 {
+			raise("Table must have at least one column!")
+		}
 	default:
 		shapeError(def, "unknown create table definition")
 	}
+	if info.Name == "" {
+		raise("Empty table name not supported")
+	}
 	return info
+}
+
+// transformWithList maps WithList <- 'WITH' RelOptionOrOids.
+// RelOptionOrOids <- RelOptionList / Oids (OIDS raise NotImplemented
+// upstream, post-parse; darkwing records no options for them).
+func (tc *transformContext) transformWithList(n tnode) []ast.RelOption {
+	_, alt := n.child(1).sole().choice()
+	if alt.name() == "RelOptionList" {
+		return tc.transformRelOptionList(alt)
+	}
+	return nil
+}
+
+// transformRelOptionList ports TransformRelOptionList:
+// RelOptionList <- Parens(List(RelOption)); option names are
+// case-insensitive and may not repeat.
+func (tc *transformContext) transformRelOptionList(n tnode) []ast.RelOption {
+	var out []ast.RelOption
+	seen := map[string]bool{}
+	for _, o := range n.sole().parens().listElems() {
+		// RelOption <- RelOptionName RelOptionArgumentOpt?
+		opt := ast.RelOption{Name: relOptionName(o.child(0))}
+		if arg, ok := o.child(1).opt(); ok {
+			// RelOptionArgumentOpt <- '=' DefArg
+			opt.Value = tc.transformDefArg(arg.child(1))
+		} else {
+			opt.Value = constExpr(invalidSpan, nullValue())
+		}
+		key := strings.ToLower(opt.Name)
+		if seen[key] {
+			raise("Duplicate option \"%s\" in WITH clause", opt.Name)
+		}
+		seen[key] = true
+		out = append(out, opt)
+	}
+	return out
+}
+
+// transformDefArg maps DefArg <- DefArgNull / DefArgStringLiteral /
+// NumberLiteral / NoneLiteral / Expression / DefArgKeyword.
+func (tc *transformContext) transformDefArg(n tnode) ast.Expr {
+	_, alt := n.sole().choice()
+	switch alt.name() {
+	case "DefArgNull", "NoneLiteral":
+		return constExpr(alt.span(), nullValue())
+	case "DefArgStringLiteral":
+		return constExpr(alt.span(), varcharValue(identifierText(alt)))
+	case "NumberLiteral":
+		return numberConstant(alt.span(), alt.number())
+	case "Expression":
+		return tc.transformExpression(alt)
+	case "DefArgKeyword":
+		return constExpr(alt.span(), varcharValue(identifierText(alt)))
+	}
+	shapeError(alt, "unknown option argument")
+	return nil
 }
 
 // CreateTableColumnElement <- CreateTableColumnDefinition / CreateTableConstraint
@@ -143,60 +226,153 @@ func (tc *transformContext) transformCreateTableElement(info *ast.CreateTableInf
 	}
 }
 
-// ColumnDefinition <- DottedIdentifier Type? GeneratedColumn?
-// ConstraintNameClause? ColumnConstraint*
+// ColumnDefinition <- Identifier Type? GeneratedColumn? ColumnConstraint*
+// Port of TransformColumnDefinition. The children transform first
+// (GeneratedColumn's checks, each constraint's own checks), then the
+// column-level validation runs in upstream's order.
 func (tc *transformContext) transformColumnDefinition(n tnode) ast.ColumnDef {
 	col := ast.ColumnDef{}
 	col.SetSpan(n.span())
-	col.Names = dottedIdentifier(n.child(0))
+	col.Names = []string{identifierText(n.child(0))}
 	if typ, ok := n.child(1).opt(); ok {
 		col.Type = tc.transformType(typ)
 	}
 	if gen, ok := n.child(2).opt(); ok {
-		// GeneratedColumn <- Generated? 'AS' Parens(Expression) GeneratedColumnType?
-		col.Generated = ast.GeneratedVirtual
-		col.Default = tc.transformExpression(gen.child(2).parens())
-		if kind, ok := gen.child(3).opt(); ok {
-			_, k := kind.sole().choice()
-			if k.name() == "StoredGeneratedColumn" {
-				col.Generated = ast.GeneratedStored
-			}
-		}
+		tc.transformGeneratedColumn(&col, gen)
 	}
+	entries := tc.transformColumnConstraints(n.child(3))
 	if col.Type == nil && col.Generated == "" {
-		raise("Column %s must have a type or be defined as a GENERATED column.", optionallyQuoted(strings.Join(col.Names, ".")))
+		raise("Column %s must have a type or be defined as a GENERATED column.", sqlIdentifier(col.Names[0]))
 	}
-	if col.Generated != "" {
-		name := col.Names[len(col.Names)-1]
-		if hasSubquery(col.Default) {
-			raise("Expression of generated column \"%s\" contains a subquery, which isn't allowed", name)
-		}
-		verifyGeneratedColumnRefs(col.Default)
-	}
-	constraintName := ""
-	if named, ok := n.child(3).opt(); ok {
-		constraintName = identifierText(named.child(1))
-	}
-	for _, c := range n.child(4).repeat() {
-		constraint := tc.transformColumnConstraint(&col, c)
-		if constraint == nil {
-			if col.Generated != "" && col.Collation != "" {
+	hasDefault, hasCollation := false, false
+	for _, e := range entries {
+		switch {
+		case e.isDefault:
+			if hasDefault {
+				raise("Cannot define a default value twice")
+			}
+			hasDefault = true
+		case e.collation != "":
+			if hasCollation {
+				raise("multiple COLLATE clauses not allowed")
+			}
+			hasCollation = true
+			if col.Generated != "" {
 				raise("Collations are not supported on generated columns")
 			}
+			applyColumnCollation(col.Type, e.collation)
+			col.Collation = e.collation
+			continue
+		case e.compression != "":
+			if strings.EqualFold(e.compression, "auto") {
+				raise("Unrecognized option for column compression, expected none, uncompressed, " +
+					"rle, dictionary, pfor, bitpacking, fsst, chimp, patas, zstd, alp, alprd or " +
+					"roaring")
+			}
+			col.Compression = e.compression
 			continue
 		}
-		if col.Generated != "" {
-			if _, isDefault := constraint.(*ast.DefaultConstraint); isDefault {
-				raise("Not allowed to set default on a generated column")
-			}
+		if e.constraint != nil {
+			col.Constraints = append(col.Constraints, e.constraint)
 		}
-		if constraintName != "" {
-			setConstraintName(constraint, constraintName)
-			constraintName = ""
+	}
+	if col.Generated != "" {
+		if hasSubquery(col.Default) {
+			raise("Expression of generated column %s contains a subquery, which isn't allowed", quotedIdent(col.Names[0]))
 		}
-		col.Constraints = append(col.Constraints, constraint)
+		if hasDefault {
+			raise("Not allowed to set default on a generated column")
+		}
 	}
 	return col
+}
+
+// transformGeneratedColumn ports TransformGeneratedColumn:
+// GeneratedColumn <- Generated? 'AS' Parens(Expression) GeneratedColumnType?
+// Generated <- GeneratedAlways / GeneratedByDefault
+func (tc *transformContext) transformGeneratedColumn(col *ast.ColumnDef, gen tnode) {
+	if g, ok := gen.child(0).opt(); ok {
+		if _, kind := g.sole().choice(); kind.name() == "GeneratedByDefault" {
+			raise("for a generated column, GENERATED ALWAYS must be specified")
+		}
+	}
+	col.Generated = ast.GeneratedVirtual
+	col.Default = tc.transformExpression(gen.child(2).parens())
+	verifyGeneratedColumnRefs(col.Default)
+	if kind, ok := gen.child(3).opt(); ok {
+		_, k := kind.sole().choice()
+		if k.name() == "StoredGeneratedColumn" {
+			col.Generated = ast.GeneratedStored
+		}
+	}
+}
+
+// columnConstraintEntry is upstream's ColumnConstraintEntry: one
+// transformed ColumnConstraint, either a constraint or a column property.
+type columnConstraintEntry struct {
+	constraint  ast.Constraint
+	isDefault   bool
+	collation   string
+	compression string
+	// notNull / unique / primary mirror constraint_type_info
+	notNull, unique, primary bool
+	check, foreignKey        bool
+}
+
+// transformColumnConstraints maps ColumnConstraint* in order.
+func (tc *transformContext) transformColumnConstraints(n tnode) []columnConstraintEntry {
+	var out []columnConstraintEntry
+	for _, c := range n.repeat() {
+		out = append(out, tc.transformColumnConstraint(c))
+	}
+	return out
+}
+
+// quotedIdent renders an Identifier formatted into an upstream exception
+// message (ExceptionFormatValue for Identifier: always double-quoted,
+// embedded quotes doubled).
+func quotedIdent(s string) string {
+	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+}
+
+// sqlIdentifier renders an identifier the way upstream's
+// SQLIdentifier::ToString does (RequiresQuotesForPrinting with
+// allow_caps): double-quoted when empty, a keyword, `_` followed by a
+// digit, or containing anything but letters, digits (not leading) and
+// underscores.
+func sqlIdentifier(s string) string {
+	needs := s == "" || token.IsKeyword(s) || (len(s) > 1 && s[0] == '_' && s[1] >= '0' && s[1] <= '9')
+	for i := 0; i < len(s) && !needs; i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c == '_':
+		case c >= '0' && c <= '9':
+			needs = i == 0
+		default:
+			needs = true
+		}
+	}
+	if !needs {
+		return s
+	}
+	return quotedIdent(s)
+}
+
+// varcharTypeNames are the builtin type names DefaultTypeGenerator maps
+// to VARCHAR.
+var varcharTypeNames = map[string]bool{
+	"varchar": true, "bpchar": true, "string": true, "char": true, "nvarchar": true, "text": true,
+}
+
+// applyColumnCollation ports PEGTransformerFactory::ApplyColumnCollation's
+// parse-time checks: a collation needs a VARCHAR-typed column.
+func applyColumnCollation(typ *ast.TypeExpression, collation string) {
+	if typ == nil {
+		raise("Specify the VARCHAR type to set a collation")
+	}
+	if !varcharTypeNames[strings.ToLower(typ.TypeName)] {
+		raise("Only VARCHAR columns can have collations!")
+	}
 }
 
 // dottedIdentifier flattens DottedIdentifier (Identifier DotColLabel*).
@@ -223,45 +399,53 @@ func setConstraintName(c ast.Constraint, name string) {
 	}
 }
 
-// transformColumnConstraint maps one ColumnConstraint; collation and
-// compression fold into the column itself and return nil.
-func (tc *transformContext) transformColumnConstraint(col *ast.ColumnDef, n tnode) ast.Constraint {
+// transformColumnConstraint maps one ColumnConstraint.
+// ColumnConstraint <- NameableColumnConstraint / ColumnCollation
+// NameableColumnConstraint <- ConstraintNameClause? ColumnConstraintElement
+// Column constraint names are parsed but not stored (upstream's
+// TransformNameableColumnConstraint).
+func (tc *transformContext) transformColumnConstraint(n tnode) columnConstraintEntry {
 	_, alt := n.sole().choice()
-	switch alt.name() {
+	if alt.name() == "ColumnCollation" {
+		// 'COLLATE' DottedIdentifier
+		return columnConstraintEntry{collation: strings.Join(dottedIdentifier(alt.child(1)), ".")}
+	}
+	if alt.name() != "NameableColumnConstraint" {
+		shapeError(alt, "unknown column constraint")
+	}
+	_, elem := alt.child(1).sole().choice()
+	switch elem.name() {
 	case "NotNullConstraint":
 		// NullConstraint / NotNullColumnConstraint
-		_, kind := alt.sole().choice()
+		_, kind := elem.sole().choice()
 		c := &ast.NotNullConstraint{Null: kind.name() == "NullConstraint"}
-		c.SetSpan(alt.span())
-		return c
+		c.SetSpan(elem.span())
+		return columnConstraintEntry{constraint: c, notNull: !c.Null}
 	case "UniqueConstraint":
 		c := &ast.UniqueConstraint{}
-		c.SetSpan(alt.span())
-		return c
+		c.SetSpan(elem.span())
+		return columnConstraintEntry{constraint: c, unique: true}
 	case "PrimaryKeyConstraint":
 		c := &ast.UniqueConstraint{IsPrimaryKey: true}
-		c.SetSpan(alt.span())
-		return c
+		c.SetSpan(elem.span())
+		return columnConstraintEntry{constraint: c, unique: true, primary: true}
 	case "DefaultValue":
 		// 'DEFAULT' ColumnDefaultExpr
-		c := &ast.DefaultConstraint{Expr: tc.transformColumnDefaultExpr(alt.child(1))}
-		c.SetSpan(alt.span())
-		return c
+		c := &ast.DefaultConstraint{Expr: tc.transformColumnDefaultExpr(elem.child(1))}
+		c.SetSpan(elem.span())
+		return columnConstraintEntry{constraint: c, isDefault: true}
 	case "CheckConstraint":
-		c := &ast.CheckConstraint{Expr: checkConstraintExpr(tc.transformExpression(alt.child(1).parens()))}
-		c.SetSpan(alt.span())
-		return c
+		c := &ast.CheckConstraint{Expr: checkConstraintExpr(tc.transformExpression(elem.child(1).parens()))}
+		c.SetSpan(elem.span())
+		return columnConstraintEntry{constraint: c, check: true}
 	case "ForeignKeyConstraint":
-		return tc.transformForeignKey(alt, nil)
-	case "ColumnCollation":
-		col.Collation = strings.Join(dottedIdentifier(alt.child(1)), ".")
-		return nil
+		return columnConstraintEntry{constraint: tc.transformForeignKey(elem, nil), foreignKey: true}
 	case "ColumnCompression":
-		col.Compression = identifierText(alt.child(2))
-		return nil
+		// 'USING' 'COMPRESSION' ColIdOrString
+		return columnConstraintEntry{compression: identifierText(elem.child(2))}
 	}
-	shapeError(alt, "unknown column constraint")
-	return nil
+	shapeError(elem, "unknown column constraint")
+	return columnConstraintEntry{}
 }
 
 // transformColumnDefaultExpr maps ColumnDefaultExpr (the restricted
@@ -276,7 +460,7 @@ func (tc *transformContext) transformColumnDefaultExpr(n tnode) ast.Expr {
 }
 
 // transformForeignKey maps ForeignKeyConstraint
-// ('REFERENCES' BaseTableName Parens(ColumnList)? KeyActions), with the
+// ('REFERENCES' BaseTableName Parens(ColumnList)? KeyActions?), with the
 // referencing columns of a table-level FOREIGN KEY.
 func (tc *transformContext) transformForeignKey(n tnode, columns []string) *ast.ForeignKeyConstraint {
 	c := &ast.ForeignKeyConstraint{Columns: columns}
@@ -287,13 +471,28 @@ func (tc *transformContext) transformForeignKey(n tnode, columns []string) *ast.
 	if cols, ok := n.child(2).opt(); ok {
 		c.ReferencedColumns = identifierList(cols.parens().sole())
 	}
-	// KeyActions <- UpdateAction? DeleteAction?
-	actions := n.child(3)
-	if ua, ok := actions.child(0).opt(); ok {
-		c.OnUpdate = keyAction(ua.child(2))
-	}
-	if da, ok := actions.child(1).opt(); ok {
-		c.OnDelete = keyAction(da.child(2))
+	// KeyActions <- UpdateFirstKeyActions / DeleteFirstKeyActions
+	// UpdateFirstKeyActions <- UpdateAction DeleteAction?
+	// DeleteFirstKeyActions <- DeleteAction UpdateAction?
+	if actions, ok := n.child(3).opt(); ok {
+		_, order := actions.sole().choice()
+		first := keyAction(order.child(0).child(2))
+		var second ast.KeyAction
+		hasSecond := false
+		if a, ok := order.child(1).opt(); ok {
+			second, hasSecond = keyAction(a.child(2)), true
+		}
+		if order.name() == "UpdateFirstKeyActions" {
+			c.OnUpdate = first
+			if hasSecond {
+				c.OnDelete = second
+			}
+		} else {
+			c.OnDelete = first
+			if hasSecond {
+				c.OnUpdate = second
+			}
+		}
 	}
 	// the table-level form checks the column counts (upstream's
 	// TransformTopForeignKeyConstraint, after the actions transform)
@@ -395,7 +594,8 @@ func (tc *transformContext) transformTopLevelConstraint(n tnode) ast.Constraint 
 	return out
 }
 
-// CreateSchemaStmt <- 'SCHEMA' IfNotExists? QualifiedName
+// CreateSchemaStmt <- 'SCHEMA' IfNotExists? QualifiedName WithOptionList?
+// WithOptionList <- 'WITH' RelOptionList
 func (tc *transformContext) transformCreateSchema(n tnode) ast.CreateInfo {
 	info := &ast.CreateSchemaInfo{}
 	info.SetSpan(n.span())
@@ -406,30 +606,48 @@ func (tc *transformContext) transformCreateSchema(n tnode) ast.CreateInfo {
 		cat = schema
 	}
 	info.Catalog, info.Name = cat, name
+	if wl, ok := n.child(3).opt(); ok {
+		info.Options = tc.transformRelOptionList(wl.child(1))
+	}
 	return info
 }
 
-// CreateViewStmt <- CreateRecursive? 'VIEW' IfNotExists? QualifiedName
-// InsertColumnList? WithList? 'AS' SelectStatementInternal
+// CreateViewStmt <- CreateSecure? CreateRecursive? 'VIEW' IfNotExists?
+// QualifiedName InsertColumnList? WithList? 'AS' SelectStatementInternal
 func (tc *transformContext) transformCreateView(n tnode) ast.CreateInfo {
 	info := &ast.CreateViewInfo{}
 	info.SetSpan(n.span())
-	if _, ok := n.child(0).opt(); ok {
-		info.Recursive = true
+	info.Secure = optMatched(n.child(0))
+	info.Recursive = optMatched(n.child(1))
+	applyIfNotExists(&info.CreateInfoBase, n.child(3))
+	tc.fillQualifiedName(&info.CreateInfoBase, n.child(4))
+	cols, hasCols := n.child(5).opt()
+	if wl, ok := n.child(6).opt(); ok {
+		info.Options = tc.transformWithList(wl)
 	}
-	applyIfNotExists(&info.CreateInfoBase, n.child(2))
-	tc.fillQualifiedName(&info.CreateInfoBase, n.child(3))
-	if cols, ok := n.child(4).opt(); ok {
+	info.Query = tc.transformSelectInternalStatement(n.child(8))
+	if info.Recursive && !hasCols {
+		raise("CREATE RECURSIVE VIEW requires a column list")
+	}
+	if hasCols {
 		info.Aliases = identifierList(cols.sole().parens())
 	}
-	info.Query = tc.transformSelectInternalStatement(n.child(7))
+	// non-constant / non-boolean DEFER_BINDING values raise InvalidInput
+	// upstream (post-parse)
+	for _, o := range info.Options {
+		if !strings.EqualFold(o.Name, "defer_binding") {
+			raise("Only DEFER_BINDING is currently supported as option for CREATE VIEW")
+		}
+	}
 	tc.pivotEntryCheck("view")
 	return info
 }
 
 // CreateIndexStmt <- UniqueIndex? 'INDEX' IfNotExists? IndexName? 'ON'
-// BaseTableName InsertColumnList? IndexType? Parens(List(IndexElement))?
-// WithList? WhereClause?
+// BaseTableName IndexType? Parens(List(IndexElement)) WithList?
+// WhereClause?
+// Without a USING clause, unqualified column elements are qualified with
+// the table name (TransformCreateIndexStmt).
 func (tc *transformContext) transformCreateIndex(n tnode) ast.CreateInfo {
 	info := &ast.CreateIndexInfo{}
 	info.SetSpan(n.span())
@@ -443,28 +661,28 @@ func (tc *transformContext) transformCreateIndex(n tnode) ast.CreateInfo {
 	ref := &ast.BaseTableRef{}
 	tc.fillBaseTableName(ref, n.child(5))
 	info.Table = ast.QualifiedName{Catalog: ref.CatalogName, Schema: ref.SchemaName, Name: ref.TableName}
-	if cols, ok := n.child(6).opt(); ok {
-		// old-style column list: plain column references
-		for _, c := range cols.sole().parens().listElems() {
-			col := &ast.ColumnRefExpression{ColumnNames: []string{identifierText(c)}}
-			col.SetSpan(c.span())
-			info.Elements = append(info.Elements, ast.IndexElement{Expr: col})
-		}
-	}
-	if idxType, ok := n.child(7).opt(); ok {
+	idxType, hasIndexType := n.child(6).opt()
+	if hasIndexType {
 		info.IndexType = identifierText(idxType.child(1))
 	}
-	if elems, ok := n.child(8).opt(); ok {
-		for _, e := range elems.parens().listElems() {
-			// IndexElement <- Expression DescOrAsc? NullsFirstOrLast?
-			info.Elements = append(info.Elements, ast.IndexElement{
-				Expr:      tc.transformExpression(e.child(0)),
-				OrderType: orderTypeOf(e.child(1)),
-				NullOrder: nullOrderOf(e.child(2)),
-			})
+	for _, e := range n.child(7).parens().listElems() {
+		// IndexElement <- Expression DescOrAsc? NullsFirstOrLast?
+		expr := tc.transformExpression(e.child(0))
+		if col, ok := expr.(*ast.ColumnRefExpression); ok && !hasIndexType && len(col.ColumnNames) == 1 {
+			qualified := &ast.ColumnRefExpression{ColumnNames: []string{ref.TableName, col.ColumnNames[0]}}
+			qualified.SetSpan(invalidSpan)
+			expr = qualified
 		}
+		info.Elements = append(info.Elements, ast.IndexElement{
+			Expr:      expr,
+			OrderType: orderTypeOf(e.child(1)),
+			NullOrder: nullOrderOf(e.child(2)),
+		})
 	}
-	if wc, ok := n.child(10).opt(); ok {
+	if wl, ok := n.child(8).opt(); ok {
+		info.Options = tc.transformWithList(wl)
+	}
+	if wc, ok := n.child(9).opt(); ok {
 		info.Where = tc.transformExpression(wc.child(1))
 	}
 	return info
@@ -499,16 +717,53 @@ func sequenceOptionKey(alt tnode) string {
 
 // seqConstant requires a sequence option value to fold to a constant
 // (upstream's TransformSeqSet* transforms; negated literals are already
-// folded by the expression transformer).
-func seqConstant(e ast.Expr) ast.Value {
+// folded by the expression transformer), and an integer one when set
+// (CheckIntegerSequenceOption).
+func (tc *transformContext) seqConstant(option string, e ast.Expr) ast.Value {
 	c, ok := e.(*ast.ConstantExpression)
 	if !ok {
 		raise("Expected constant expression.")
 	}
+	if !c.Value.IsNull && !literalIsInteger(c.Value) {
+		raise("Expected an integer argument for %s, got %s", option, tc.literalText(c))
+	}
 	return c.Value
 }
 
-// seqInt extracts an int64 option value. Non-integer constants fail
+// literalIsInteger reports whether a constant is an INTEGER literal
+// (upstream's LiteralKind::INTEGER: digits only, no '.' or exponent).
+func literalIsInteger(v ast.Value) bool {
+	switch v.Type.ID {
+	case "INTEGER", "BIGINT", "HUGEINT", "UHUGEINT", "BIGNUM", "VARINT":
+		return true
+	}
+	return false
+}
+
+// literalText renders a constant the way upstream's Literal::ToString
+// does: numbers as written, strings single-quoted, booleans as
+// true/false.
+func (tc *transformContext) literalText(c *ast.ConstantExpression) string {
+	v := c.Value
+	switch {
+	case v.IsNull:
+		return "NULL"
+	case v.Kind == ast.ValueBool:
+		if v.Bool {
+			return "true"
+		}
+		return "false"
+	case v.Kind == ast.ValueString:
+		return "'" + strings.ReplaceAll(v.Str, "'", "''") + "'"
+	}
+	sp := c.Span
+	if sp.Start >= 0 && sp.End <= len(tc.src) && sp.Start < sp.End {
+		return strings.Join(strings.Fields(tc.src[sp.Start:sp.End]), "")
+	}
+	return v.Type.ID
+}
+
+// seqInt extracts an int64 option value. Values outside int64 fail
 // upstream with a conversion error (post-parse), so ok=false skips the
 // parse-time range checks.
 func seqInt(v ast.Value) (int64, bool) {
@@ -520,7 +775,8 @@ func seqInt(v ast.Value) (int64, bool) {
 
 // CreateSequenceStmt <- 'SEQUENCE' IfNotExists? QualifiedName SequenceOption*
 // Port of TransformCreateSequenceStmt, including its parse-time option
-// validation: duplicates, NULL values, zero increments and the
+// validation. The option transforms run first (constant and integer
+// checks), then duplicates, NULL values, zero increments and the
 // min/max/start range checks over the evaluated defaults.
 func (tc *transformContext) transformCreateSequence(n tnode) ast.CreateInfo {
 	info := &ast.CreateSequenceInfo{}
@@ -528,25 +784,58 @@ func (tc *transformContext) transformCreateSequence(n tnode) ast.CreateInfo {
 	applyIfNotExists(&info.CreateInfoBase, n.child(1))
 	tc.fillQualifiedName(&info.CreateInfoBase, n.child(2))
 
-	seen := map[string]bool{}
-	inc, minV, maxV, start := int64(1), int64(1), int64(math.MaxInt64), int64(0)
-	minSet, maxSet, startSet := false, false, false
-	evalOK := true
+	type seqOpt struct {
+		key  string
+		alt  tnode
+		expr ast.Expr
+	}
+	var opts []seqOpt
 	for _, o := range n.child(3).repeat() {
 		_, alt := o.sole().choice()
 		key := sequenceOptionKey(alt)
-		if seen[key] {
-			raise("%s should be passed at most once", strings.ToUpper(key[:1])+key[1:])
+		var scratch ast.CreateSequenceInfo
+		if alt.name() != "SeqOwnedBy" {
+			tc.applySequenceOption(&scratch, o)
 		}
-		seen[key] = true
-		switch alt.name() {
-		case "SeqSetCycle":
-			_, kind := alt.sole().choice()
+		var expr ast.Expr
+		switch key {
+		case "increment":
+			expr = scratch.Increment
+		case "minvalue":
+			expr = scratch.MinValue
+		case "maxvalue":
+			expr = scratch.MaxValue
+		case "start":
+			expr = scratch.StartValue
+		}
+		opts = append(opts, seqOpt{key: key, alt: alt, expr: expr})
+	}
+
+	seen := map[string]bool{}
+	for _, o := range opts {
+		if seen[o.key] {
+			raise("%s should be passed at most once", strings.ToUpper(o.key[:1])+o.key[1:])
+		}
+		seen[o.key] = true
+	}
+	if seen["nominvalue"] && seen["minvalue"] {
+		raise("Minvalue should be passed at most once")
+	}
+	if seen["nomaxvalue"] && seen["maxvalue"] {
+		raise("Maxvalue should be passed at most once")
+	}
+
+	inc, minV, maxV, start := int64(1), int64(1), int64(math.MaxInt64), int64(0)
+	minSet, maxSet, startSet := false, false, false
+	evalOK := true
+	for _, o := range opts {
+		switch o.key {
+		case "cycle":
+			_, kind := o.alt.sole().choice()
 			info.Cycle = kind.name() == "SeqCycle"
-		case "SeqSetIncrement":
-			// 'INCREMENT' 'BY'? Expression
-			info.Increment = tc.transformExpression(alt.child(2))
-			v := seqConstant(info.Increment)
+		case "increment":
+			info.Increment = o.expr
+			v := o.expr.(*ast.ConstantExpression).Value
 			if v.IsNull {
 				raise("INCREMENT must not be NULL")
 			}
@@ -558,12 +847,10 @@ func (tc *transformContext) transformCreateSequence(n tnode) ast.CreateInfo {
 			} else {
 				evalOK = false
 			}
-		case "SeqSetMinMax":
-			// SeqMinOrMax Expression
-			expr := tc.transformExpression(alt.child(1))
-			v := seqConstant(expr)
-			if seqIsMin(alt.child(0)) {
-				info.MinValue = expr
+		case "minvalue", "maxvalue":
+			v := o.expr.(*ast.ConstantExpression).Value
+			if o.key == "minvalue" {
+				info.MinValue = o.expr
 				if v.IsNull {
 					raise("MINVALUE must not be NULL")
 				}
@@ -573,7 +860,7 @@ func (tc *transformContext) transformCreateSequence(n tnode) ast.CreateInfo {
 					evalOK = false
 				}
 			} else {
-				info.MaxValue = expr
+				info.MaxValue = o.expr
 				if v.IsNull {
 					raise("MAXVALUE must not be NULL")
 				}
@@ -583,17 +870,13 @@ func (tc *transformContext) transformCreateSequence(n tnode) ast.CreateInfo {
 					evalOK = false
 				}
 			}
-		case "SeqNoMinMax":
-			// 'NO' SeqMinOrMax
-			if seqIsMin(alt.child(1)) {
-				info.NoMinValue = true
-			} else {
-				info.NoMaxValue = true
-			}
-		case "SeqStartWith":
-			// 'START' 'WITH'? Expression
-			info.StartValue = tc.transformExpression(alt.child(2))
-			v := seqConstant(info.StartValue)
+		case "nominvalue":
+			info.NoMinValue = true
+		case "nomaxvalue":
+			info.NoMaxValue = true
+		case "start":
+			info.StartValue = o.expr
+			v := o.expr.(*ast.ConstantExpression).Value
 			if v.IsNull {
 				raise("START value must not be NULL")
 			}
@@ -602,16 +885,10 @@ func (tc *transformContext) transformCreateSequence(n tnode) ast.CreateInfo {
 			} else {
 				evalOK = false
 			}
-		case "SeqOwnedBy":
+		case "owned":
 			// OWNED BY is an ALTER SEQUENCE option upstream
 			raise("Unrecognized option \"owned\" for CREATE SEQUENCE")
 		}
-	}
-	if seen["nominvalue"] && seen["minvalue"] {
-		raise("Minvalue should be passed at most once")
-	}
-	if seen["nomaxvalue"] && seen["maxvalue"] {
-		raise("Maxvalue should be passed at most once")
 	}
 	if evalOK {
 		if inc < 0 {
@@ -654,11 +931,15 @@ func (tc *transformContext) applySequenceOption(info *ast.CreateSequenceInfo, n 
 	case "SeqSetIncrement":
 		// 'INCREMENT' 'BY'? Expression
 		info.Increment = tc.transformExpression(alt.child(2))
-		seqConstant(info.Increment)
+		tc.seqConstant("INCREMENT", info.Increment)
 	case "SeqSetMinMax":
 		// SeqMinOrMax Expression
 		expr := tc.transformExpression(alt.child(1))
-		seqConstant(expr)
+		if seqIsMin(alt.child(0)) {
+			tc.seqConstant("MINVALUE", expr)
+		} else {
+			tc.seqConstant("MAXVALUE", expr)
+		}
 		if seqIsMin(alt.child(0)) {
 			info.MinValue = expr
 		} else {
@@ -674,7 +955,7 @@ func (tc *transformContext) applySequenceOption(info *ast.CreateSequenceInfo, n 
 	case "SeqStartWith":
 		// 'START' 'WITH'? Expression
 		info.StartValue = tc.transformExpression(alt.child(2))
-		seqConstant(info.StartValue)
+		tc.seqConstant("START", info.StartValue)
 	case "SeqOwnedBy":
 		cat, schema, name := tc.transformQualifiedNameParts(alt.child(2))
 		info.OwnedBy = &ast.QualifiedName{Catalog: cat, Schema: schema, Name: name}
@@ -702,11 +983,24 @@ func (tc *transformContext) transformCreateType(n tnode) ast.CreateInfo {
 		info.IsEnum = true
 		info.EnumQuery = tc.transformSelectInternalStatement(kind.child(1).parens())
 	case "EnumStringLiteralList":
+		// 'ENUM' Parens(List(StringLiteral)?) ArrayBounds*: with bounds
+		// the created type is a list/array of the enum
 		info.IsEnum = true
 		if list, ok := kind.child(1).parens().opt(); ok {
 			for _, s := range list.listElems() {
 				info.EnumValues = append(info.EnumValues, identifierText(s))
 			}
+		}
+		if bounds := kind.child(2).repeat(); len(bounds) > 0 {
+			var args []ast.Expr
+			for _, v := range info.EnumValues {
+				args = append(args, constExpr(invalidSpan, varcharValue(v)))
+			}
+			t := typeExpr(invalidSpan, "ENUM", args...)
+			for _, b := range bounds {
+				t = tc.applyArrayBound(t, b)
+			}
+			info.Type = t
 		}
 	default:
 		shapeError(kind, "unknown create type")
@@ -777,7 +1071,9 @@ func (tc *transformContext) transformAlter(n tnode) ast.Stmt {
 		info.SetSpan(alt.span())
 		stmt.Actions = append(stmt.Actions, info)
 	case "AlterSchemaStmt":
-		// 'SCHEMA' IfExists? QualifiedName RenameAlter
+		// 'SCHEMA' IfExists? QualifiedName AlterSchemaOptions
+		// AlterSchemaOptions <- RenameAlter / SetOptions / ResetOptions
+		// (RENAME raises NotImplemented upstream: post-parse)
 		stmt.Entity = ast.AlterEntitySchema
 		stmt.IfExists = optMatched(alt.child(1))
 		cat, schema, name := tc.transformQualifiedNameParts(alt.child(2))
@@ -785,7 +1081,17 @@ func (tc *transformContext) transformAlter(n tnode) ast.Stmt {
 			cat = schema
 		}
 		stmt.Name = ast.QualifiedName{Catalog: cat, Name: name}
-		stmt.Actions = append(stmt.Actions, tc.transformRenameAlter(alt.child(3)))
+		_, opt := alt.child(3).sole().choice()
+		switch opt.name() {
+		case "RenameAlter":
+			stmt.Actions = append(stmt.Actions, tc.transformRenameAlter(opt))
+		case "SetOptions":
+			stmt.Actions = append(stmt.Actions, tc.transformSetOptions(opt))
+		case "ResetOptions":
+			stmt.Actions = append(stmt.Actions, tc.transformResetOptions(opt))
+		default:
+			shapeError(opt, "unknown alter schema option")
+		}
 	default:
 		shapeError(alt, "unknown alter statement")
 	}
@@ -813,7 +1119,7 @@ func (tc *transformContext) qualifiedSequenceName(n tnode) ast.QualifiedName {
 	return q
 }
 
-// transformRenameAlter maps RenameAlter ('RENAME' 'TO' Identifier).
+// transformRenameAlter maps RenameAlter ('RENAME' 'TO' ColIdOrString).
 func (tc *transformContext) transformRenameAlter(n tnode) ast.AlterInfo {
 	info := &ast.RenameInfo{NewName: identifierText(n.child(2))}
 	info.SetSpan(n.span())
@@ -837,35 +1143,20 @@ func (tc *transformContext) transformAlterTableOption(n tnode) ast.AlterInfo {
 		// 'ADD' 'COLUMN'? IfNotExists? AddColumnEntry
 		info := &ast.AddColumnInfo{IfNotExists: optMatched(alt.child(2))}
 		info.SetSpan(alt.span())
-		entry := alt.child(3)
-		// AddColumnEntry <- DottedIdentifier Type? GeneratedColumn? ColumnConstraint*
-		col := ast.ColumnDef{Names: dottedIdentifier(entry.child(0))}
-		col.SetSpan(entry.span())
-		if typ, ok := entry.child(1).opt(); ok {
-			col.Type = tc.transformType(typ)
+		info.Column = tc.transformAddColumnEntry(alt.child(3))
+		return info
+	case "DropConstraint":
+		// 'DROP' 'CONSTRAINT' IfExists? ConstraintName DropBehavior?
+		// (TransformDropConstraint raises NotImplemented: post-parse)
+		info := &ast.DropConstraintInfo{
+			IfExists: optMatched(alt.child(2)),
+			Name:     identifierText(alt.child(3)),
 		}
-		if gen, ok := entry.child(2).opt(); ok {
-			col.Generated = ast.GeneratedVirtual
-			col.Default = tc.transformExpression(gen.child(2).parens())
-			if kind, ok := gen.child(3).opt(); ok {
-				_, k := kind.sole().choice()
-				if k.name() == "StoredGeneratedColumn" {
-					col.Generated = ast.GeneratedStored
-				}
-			}
+		if behavior, ok := alt.child(4).opt(); ok {
+			_, b := behavior.sole().choice()
+			info.Cascade = b.name() == "CascadeDropBehavior"
 		}
-		if col.Type == nil && col.Generated == "" {
-			raise("Column definition requires a type or generated expression")
-		}
-		if col.Generated != "" {
-			raise("Adding generated columns after table creation is not supported yet")
-		}
-		for _, c := range entry.child(3).repeat() {
-			if constraint := tc.transformColumnConstraint(&col, c); constraint != nil {
-				col.Constraints = append(col.Constraints, constraint)
-			}
-		}
-		info.Column = col
+		info.SetSpan(alt.span())
 		return info
 	case "DropColumn":
 		// 'DROP' 'COLUMN'? IfExists? NestedColumnName DropBehavior?
@@ -887,10 +1178,8 @@ func (tc *transformContext) transformAlterTableOption(n tnode) ast.AlterInfo {
 		info := &ast.AddConstraintInfo{Constraint: tc.transformTopLevelConstraint(alt.child(1))}
 		info.SetSpan(alt.span())
 		return info
-	case "ChangeNullability":
-		return tc.transformChangeNullability(nil, alt)
 	case "RenameColumn":
-		// 'RENAME' 'COLUMN'? NestedColumnName 'TO' Identifier
+		// 'RENAME' 'COLUMN'? NestedColumnName 'TO' ColIdOrString
 		info := &ast.RenameColumnInfo{
 			Column:  nestedColumnName(alt.child(2)),
 			NewName: identifierText(alt.child(4)),
@@ -919,40 +1208,102 @@ func (tc *transformContext) transformAlterTableOption(n tnode) ast.AlterInfo {
 		info.SetSpan(alt.span())
 		return info
 	case "SetOptions":
-		info := &ast.GenericAlterInfo{Kind: "SET_OPTIONS"}
-		info.SetSpan(alt.span())
-		return info
+		return tc.transformSetOptions(alt)
 	case "ResetOptions":
-		info := &ast.GenericAlterInfo{Kind: "RESET_OPTIONS"}
-		info.SetSpan(alt.span())
-		// RESET (...) options cannot carry values (a bare NULL passes,
-		// mirroring upstream's null-constant default); upstream checks
-		// the whole list and names the last offending option
-		offender := ""
-		for _, o := range alt.child(1).parens().listElems() {
-			// RelOption <- RelOptionName RelOptionArgumentOpt?
-			if arg, ok := o.child(1).opt(); ok {
-				// RelOptionArgumentOpt <- '=' DefArg
-				_, def := arg.child(1).sole().choice()
-				if def.name() != "DefArgNull" {
-					offender = relOptionName(o.child(0))
-				}
-			}
-		}
-		if offender != "" {
-			raise("Reset option \"%s\" cannot set any value. Did you mean to use SET?", offender)
-		}
-		return info
+		return tc.transformResetOptions(alt)
 	}
 	shapeError(alt, "unknown alter table option")
 	return nil
 }
 
-// relOptionName reads a RelOptionName (DottedIdentifierString / StringLiteral).
+// transformSetOptions maps SetOptions <- 'SET' RelOptionList.
+func (tc *transformContext) transformSetOptions(n tnode) ast.AlterInfo {
+	info := &ast.GenericAlterInfo{Kind: "SET_OPTIONS", Options: tc.transformRelOptionList(n.child(1))}
+	info.SetSpan(n.span())
+	return info
+}
+
+// transformResetOptions maps ResetOptions <- 'RESET' RelOptionList.
+// RESET (...) options cannot carry values (a NULL/NONE value passes,
+// mirroring upstream's null-constant default); upstream checks the whole
+// list and names the last offending option.
+func (tc *transformContext) transformResetOptions(n tnode) ast.AlterInfo {
+	info := &ast.GenericAlterInfo{Kind: "RESET_OPTIONS", Options: tc.transformRelOptionList(n.child(1))}
+	info.SetSpan(n.span())
+	offender := ""
+	for _, o := range info.Options {
+		if c, ok := o.Value.(*ast.ConstantExpression); !ok || !c.Value.IsNull {
+			offender = o.Name
+		}
+	}
+	if offender != "" {
+		raise("Reset option \"%s\" cannot set any value. Did you mean to use SET?", offender)
+	}
+	for i := range info.Options {
+		info.Options[i].Value = nil
+	}
+	return info
+}
+
+// transformAddColumnEntry ports TransformAddColumnEntry + TransformAddColumn:
+// AddColumnEntry <- DottedIdentifier Type? GeneratedColumn? ColumnConstraint*
+func (tc *transformContext) transformAddColumnEntry(entry tnode) ast.ColumnDef {
+	col := ast.ColumnDef{Names: dottedIdentifier(entry.child(0))}
+	col.SetSpan(entry.span())
+	if typ, ok := entry.child(1).opt(); ok {
+		col.Type = tc.transformType(typ)
+	}
+	if gen, ok := entry.child(2).opt(); ok {
+		tc.transformGeneratedColumn(&col, gen)
+	}
+	entries := tc.transformColumnConstraints(entry.child(3))
+	if col.Type == nil && col.Generated == "" {
+		raise("Column definition requires a type or generated expression")
+	}
+	if col.Generated != "" {
+		raise("Adding generated columns after table creation is not supported yet")
+	}
+	hasDefault := false
+	for _, e := range entries {
+		switch {
+		case e.isDefault:
+			if hasDefault {
+				raise("Cannot define a default value twice")
+			}
+			hasDefault = true
+		case e.notNull, e.unique && !e.primary:
+			// NOT NULL / UNIQUE become follow-up ALTERs upstream
+		case e.primary:
+			raise("Adding columns with PRIMARY KEY constraints is not supported yet")
+		case e.check:
+			raise("Adding columns with CHECK constraints is not supported yet")
+		case e.foreignKey:
+			raise("Adding columns with FOREIGN KEY constraints is not supported yet")
+		case e.compression != "":
+			if strings.EqualFold(e.compression, "auto") {
+				raise("Unrecognized option for column compression")
+			}
+			col.Compression = e.compression
+			continue
+		case e.collation != "":
+			applyColumnCollation(col.Type, e.collation)
+			col.Collation = e.collation
+			continue
+		}
+		if e.constraint != nil {
+			col.Constraints = append(col.Constraints, e.constraint)
+		}
+	}
+	return col
+}
+
+// relOptionName reads a RelOptionName (DottedColLabel / StringLiteral).
+// DottedColLabel <- ColLabel DotColLabel* joins with dots
+// (TransformDottedColLabel).
 func relOptionName(n tnode) string {
 	_, alt := n.sole().choice()
-	if alt.name() == "DottedIdentifierString" {
-		return strings.Join(dottedIdentifier(alt.sole()), ".")
+	if alt.name() == "DottedColLabel" {
+		return strings.Join(dottedIdentifier(alt), ".")
 	}
 	return identifierText(alt)
 }
@@ -999,17 +1350,25 @@ func (tc *transformContext) transformAlterColumnEntry(column []string, n tnode, 
 	case "ChangeNullability":
 		return tc.transformChangeNullability(column, alt)
 	case "AlterType":
-		// SetData? 'TYPE' Type? UsingExpression?
+		// SetData? 'TYPE' Type? ColumnCollation? UsingExpression?
 		info := &ast.AlterColumnTypeInfo{Column: column}
 		info.SetSpan(sp)
 		if typ, ok := alt.child(2).opt(); ok {
 			info.Type = tc.transformType(typ)
 		}
-		if using, ok := alt.child(3).opt(); ok {
+		collation := ""
+		if coll, ok := alt.child(3).opt(); ok {
+			collation = strings.Join(dottedIdentifier(coll.child(1)), ".")
+		}
+		if using, ok := alt.child(4).opt(); ok {
 			info.Using = tc.transformExpression(using.child(1))
 		}
 		if info.Type == nil && info.Using == nil {
 			raise("Omitting the type is only possible in combination with USING")
+		}
+		if collation != "" {
+			applyColumnCollation(info.Type, collation)
+			info.Collation = collation
 		}
 		return info
 	}
@@ -1047,11 +1406,11 @@ func (tc *transformContext) transformDrop(n tnode) ast.Stmt {
 			stmt.Names = append(stmt.Names, ast.QualifiedName{Catalog: ref.CatalogName, Schema: ref.SchemaName, Name: ref.TableName})
 		}
 	case "DropTableFunction":
-		// CommentMacroTable IfExists? List(TableFunctionName)
+		// CommentMacroTable IfExists? List(QualifiedTableFunction)
 		stmt.DropType = ast.DropMacroTable
 		stmt.IfExists = optMatched(alt.child(1))
 		for _, name := range alt.child(2).listElems() {
-			stmt.Names = append(stmt.Names, ast.QualifiedName{Name: identifierText(name)})
+			stmt.Names = append(stmt.Names, qualifiedTableFunctionName(name))
 		}
 	case "DropFunction":
 		// FunctionTypeMacro IfExists? List(FunctionIdentifier)
@@ -1111,6 +1470,9 @@ func (tc *transformContext) transformDrop(n tnode) ast.Stmt {
 		stmt.IfExists = optMatched(alt.child(2))
 		stmt.Names = append(stmt.Names, ast.QualifiedName{Name: identifierText(alt.child(3))})
 		if storage, ok := alt.child(4).opt(); ok {
+			if stmt.Temporary {
+				raise("Can not combine TEMPORARY with specifying a storage for drop secret")
+			}
 			stmt.Storage = identifierText(storage.child(1))
 		}
 	case "DropTrigger":
@@ -1121,7 +1483,32 @@ func (tc *transformContext) transformDrop(n tnode) ast.Stmt {
 	default:
 		shapeError(alt, "unknown drop entry")
 	}
+	if _, ok := n.child(2).opt(); ok && stmt.DropType == ast.DropSecret {
+		raise("CASCADE and RESTRICT are not supported for DROP SECRET")
+	}
 	return stmt
+}
+
+// qualifiedTableFunctionName maps QualifiedTableFunction
+// (CatalogQualification? SchemaQualification* TableFunctionName) to a
+// three-part name: like QualifiedName, the schema is the component
+// before the name and the catalog leads a path of three or more.
+func qualifiedTableFunctionName(n tnode) ast.QualifiedName {
+	var path []string
+	if cq, ok := n.child(0).opt(); ok {
+		path = append(path, identifierText(cq.child(0)))
+	}
+	for _, sq := range n.child(1).repeat() {
+		path = append(path, identifierText(sq.child(0)))
+	}
+	q := ast.QualifiedName{Name: identifierText(n.child(2))}
+	if len(path) >= 1 {
+		q.Schema = path[len(path)-1]
+	}
+	if len(path) >= 2 {
+		q.Catalog = path[0]
+	}
+	return q
 }
 
 // qualifiedIndexName maps QualifiedIndexName.
@@ -1152,9 +1539,10 @@ func (tc *transformContext) transformFunctionIdentifierRaw(n tnode) (catalog, sc
 	_, alt := n.sole().choice()
 	switch alt.name() {
 	case "CatalogReservedSchemaFunctionName":
+		// CatalogQualification ReservedSchemaQualification* ReservedFunctionName
 		catalog = identifierText(alt.child(0).child(0))
-		if sq, ok := alt.child(1).opt(); ok {
-			schema = identifierText(sq.child(0))
+		if schemas := alt.child(1).repeat(); len(schemas) > 0 {
+			schema = identifierText(schemas[len(schemas)-1].child(0))
 		}
 		name = identifierText(alt.child(2))
 	case "SchemaReservedFunctionName":

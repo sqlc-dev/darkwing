@@ -112,7 +112,13 @@ type Oracle struct {
 
 // preamble disables extension auto-loading and bounds resource use so the
 // oracle's verdicts depend only on parsing and cheap post-parse checks.
-const preamble = "SET autoinstall_known_extensions=false;\n" +
+// It also turns off the CLI's own grammar extension: since v2.0.0 the
+// shell opens with active_grammar_extensions=['shell'], which re-adds bare
+// expression statements ("1 + 1") that the library grammar - the one
+// darkwing vendors and every embedded DuckDB parses with - rejects
+// (tools/shell/shell_grammar_extension.cpp).
+const preamble = "SET active_grammar_extensions=[];\n" +
+	"SET autoinstall_known_extensions=false;\n" +
 	"SET autoload_known_extensions=false;\n" +
 	"SET memory_limit='512MB';\n" +
 	"SET threads=1;\n"

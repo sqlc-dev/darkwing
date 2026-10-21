@@ -188,13 +188,12 @@ type ShowType string
 const (
 	ShowTypeDescribe ShowType = "DESCRIBE"
 	ShowTypeSummary  ShowType = "SUMMARY"
-	// ShowTypeShow is "SHOW name": a setting, falling back to describing
-	// a table (v2.0).
+	// ShowTypeShow is `SHOW name`: a setting, falling back to describing
+	// a table of that name.
 	ShowTypeShow     ShowType = "SHOW"
 	ShowTypeShowFrom ShowType = "SHOW_FROM"
-	// ShowTypeShowSpecial is the MySQL-inherited special forms (SHOW
-	// TABLES/DATABASES/SCHEMAS/VARIABLES, SHOW ALL TABLES); v2.0 renamed
-	// SHOW_UNQUALIFIED.
+	// ShowTypeShowSpecial is SHOW TABLES / DATABASES / SCHEMAS /
+	// VARIABLES and SHOW ALL TABLES.
 	ShowTypeShowSpecial ShowType = "SHOW_SPECIAL"
 )
 

@@ -241,6 +241,8 @@ type ExplainType string
 const (
 	ExplainStandard ExplainType = "EXPLAIN_STANDARD"
 	ExplainAnalyze  ExplainType = "EXPLAIN_ANALYZE"
+	// ExplainSQL is EXPLAIN (SQL): render the plan back as SQL.
+	ExplainSQL ExplainType = "EXPLAIN_SQL"
 )
 
 // ExplainStatement is EXPLAIN [ANALYZE] [(options)] <statement>. Port of

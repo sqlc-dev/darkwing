@@ -32,6 +32,10 @@ func TestStatementErrorsV2(t *testing.T) {
 		{"CREATE SCHEMA s WITH (a = 1, A = 2)", `Duplicate option "A" in WITH clause`},
 		{"ALTER TABLE t SET (a = 1, a = 2)", `Duplicate option "a" in WITH clause`},
 		{"ALTER SCHEMA s RESET (a = 2)", `Reset option "a" cannot set any value. Did you mean to use SET?`},
+		// TransformExplainStatement -> PivotEntryCheck
+		{"EXPLAIN (SQL) PIVOT (SELECT 1 AS i) ON i", "PIVOT statements with pivot elements extracted from the data cannot be used in EXPLAIN (SQL) statements.\n" +
+			"In order to use PIVOT in a EXPLAIN (SQL) statement the PIVOT values must be manually specified, e.g.:\n" +
+			"PIVOT ... ON i IN (val1, val2, ...)"},
 		// TransformCreateStatement
 		{"CREATE PERSISTENT TABLE t (a INT)", "PERSISTENT is only supported for CREATE SECRET"},
 		{"CREATE TEMP INDEX i ON t (a)", "Temporary indexes are not supported"},

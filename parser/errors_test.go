@@ -85,11 +85,11 @@ func TestErrorPositions(t *testing.T) {
 		line, col int
 	}{
 		{
-			// SELCT itself parses as a bare expression statement (a
-			// column reference), so the failure lands on the 1
+			// v2.0.0 dropped bare expression statements from the
+			// library grammar, so the failure lands on SELCT itself
 			sql:    "SELCT 1",
-			msg:    `Parser Error: syntax error at or near "1"`,
-			offset: 6, line: 1, col: 7,
+			msg:    `Parser Error: syntax error at or near "SELCT"`,
+			offset: 0, line: 1, col: 1,
 		},
 		{
 			sql:    "SELECT 1 2",
@@ -98,8 +98,8 @@ func TestErrorPositions(t *testing.T) {
 		},
 		{
 			sql:    "SELECT 1;\nSELCT 2;",
-			msg:    `Parser Error: syntax error at or near "2"`,
-			offset: 16, line: 2, col: 7,
+			msg:    `Parser Error: syntax error at or near "SELCT"`,
+			offset: 10, line: 2, col: 1,
 		},
 		{
 			sql:    "SELECT 1\nFROM t\nWHERE (",

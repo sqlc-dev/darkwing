@@ -621,12 +621,15 @@ func (tc *transformContext) transformExecute(n tnode) ast.Stmt {
 // ---- EXPLAIN -----------------------------------------------------------
 
 // ExplainStatement <- 'EXPLAIN' AnalyzeKeyword? ExplainOptionList? ExplainableStatements
-// Unknown options and malformed FORMAT arguments raise
-// NotImplemented/InvalidInput upstream (post-parse); darkwing records
-// what it recognizes and accepts.
+// Unknown options, malformed FORMAT/SQL arguments and SQL combined with
+// ANALYZE or FORMAT raise NotImplemented/InvalidInput upstream
+// (post-parse); darkwing records what it recognizes and accepts. The one
+// Parser Error is PivotEntryCheck for EXPLAIN (SQL), which runs after the
+// explained statement is transformed.
 func (tc *transformContext) transformExplain(n tnode) ast.Stmt {
 	stmt := &ast.ExplainStatement{Type: ast.ExplainStandard}
 	stmt.SetSpan(n.span())
+	sqlIsSet := false
 	if _, ok := n.child(1).opt(); ok {
 		stmt.Type = ast.ExplainAnalyze
 	}
@@ -646,6 +649,8 @@ func (tc *transformContext) transformExplain(n tnode) ast.Stmt {
 				}
 			case "analyze":
 				stmt.Type = ast.ExplainAnalyze
+			case "sql":
+				sqlIsSet = true
 			}
 		}
 	}
@@ -658,6 +663,10 @@ func (tc *transformContext) transformExplain(n tnode) ast.Stmt {
 		stmt.Statement = fn(tc, inner)
 	} else {
 		shapeError(inner, "unknown explainable statement")
+	}
+	if sqlIsSet {
+		tc.pivotEntryCheck("EXPLAIN (SQL) statement")
+		stmt.Type = ast.ExplainSQL
 	}
 	return stmt
 }

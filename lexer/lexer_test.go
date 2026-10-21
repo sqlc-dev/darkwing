@@ -103,17 +103,33 @@ func TestStrings(t *testing.T) {
 func TestQuotedIdentifiers(t *testing.T) {
 	check(t, `"my table"`, []tok{{token.Identifier, `"my table"`, 0}})
 	check(t, `"a""b"`, []tok{{token.Identifier, `"a""b"`, 0}})
+	// backticks delimit identifiers too, each closed only by its own
+	// delimiter and escaped by doubling it
+	check(t, "`my table`", []tok{{token.Identifier, "`my table`", 0}})
+	check(t, "`a``b` `x\"y`", []tok{
+		{token.Identifier, "`a``b`", 0},
+		{token.Identifier, "`x\"y`", 7},
+	})
+	check(t, "\"a`b\"", []tok{{token.Identifier, "\"a`b\"", 0}})
+	// a backtick ends a bare word
+	check(t, "a`b`", []tok{
+		{token.Identifier, "a", 0},
+		{token.Identifier, "`b`", 1},
+	})
 }
 
 func TestDollarQuotedStrings(t *testing.T) {
-	// empty tag: rewritten to a plain quoted literal
-	check(t, "$$abc$$", []tok{{token.String, "'abc'", 0}})
+	// the token keeps its raw text, delimiters included; the string
+	// literal matcher strips them
+	check(t, "$$abc$$", []tok{{token.String, "$$abc$$", 0}})
 	// named tag
-	check(t, "$tag$abc$tag$", []tok{{token.String, "'abc'", 0}})
-	// embedded quotes are doubled during the rewrite
-	check(t, "$$it's$$", []tok{{token.String, "'it''s'", 0}})
+	check(t, "$tag$abc$tag$ 1", []tok{
+		{token.String, "$tag$abc$tag$", 0},
+		{token.Number, "1", 14},
+	})
+	check(t, "$$it's$$", []tok{{token.String, "$$it's$$", 0}})
 	// mismatched inner marker does not close the string
-	check(t, "$a$x$b$y$a$", []tok{{token.String, "'x$b$y'", 0}})
+	check(t, "$a$x$b$y$a$", []tok{{token.String, "$a$x$b$y$a$", 0}})
 	// $1 is a parameter, never a dollar-quote opener
 	check(t, "$1", []tok{
 		{token.Operator, "$", 0},
@@ -175,11 +191,20 @@ func TestNumbers(t *testing.T) {
 		{token.Number, "0", 0},
 		{token.Identifier, "x1A", 1},
 	})
-	// underscore separators: only underscore-digit is allowed
+	// underscore separators must sit between two digits
 	check(t, "1_000", []tok{{token.Number, "1_000", 0}})
 	check(t, "1__0", []tok{
 		{token.Number, "1", 0},
 		{token.Identifier, "__0", 1},
+	})
+	check(t, "1_.5", []tok{
+		{token.Number, "1", 0},
+		{token.Identifier, "_", 1},
+		{token.Number, ".5", 2},
+	})
+	check(t, "1._5", []tok{
+		{token.Number, "1.", 0},
+		{token.Identifier, "_5", 2},
 	})
 	// double exponent splits at the second marker
 	check(t, "1ee5", []tok{
@@ -259,6 +284,60 @@ func TestOperators(t *testing.T) {
 		{token.Operator, "!=", 2},
 		{token.Identifier, "b", 5},
 	})
+	// the trimming rule also applies to a trailing '-', but never trims
+	// an operator to nothing
+	check(t, "a<-b", []tok{
+		{token.Identifier, "a", 0},
+		{token.Operator, "<", 1},
+		{token.Operator, "-", 2},
+		{token.Identifier, "b", 3},
+	})
+	check(t, "a++b", []tok{
+		{token.Identifier, "a", 0},
+		{token.Operator, "+", 1},
+		{token.Operator, "+", 2},
+		{token.Identifier, "b", 3},
+	})
+	// ':' is a single-byte operator, except in "::" and ":="
+	check(t, "a:b", []tok{
+		{token.Identifier, "a", 0},
+		{token.Operator, ":", 1},
+		{token.Identifier, "b", 2},
+	})
+	// a compound colon followed by an operator character is handed to the
+	// operator state, which does not continue past ':'
+	check(t, "x::-1", []tok{
+		{token.Identifier, "x", 0},
+		{token.Operator, ":", 1},
+		{token.Operator, ":", 2},
+		{token.Operator, "-", 3},
+		{token.Number, "1", 4},
+	})
+	check(t, "x:=-1", []tok{
+		{token.Identifier, "x", 0},
+		{token.Operator, ":=", 1},
+		{token.Operator, "-", 3},
+		{token.Number, "1", 4},
+	})
+	// a comment start ends an operator
+	check(t, "1+--c\n2", []tok{
+		{token.Number, "1", 0},
+		{token.Operator, "+", 1},
+		{token.Number, "2", 6},
+	})
+	check(t, "1+/* c */2", []tok{
+		{token.Number, "1", 0},
+		{token.Operator, "+", 1},
+		{token.Number, "2", 9},
+	})
+	// operator characters outside the PostgreSQL set do not continue an
+	// operator
+	check(t, "a=\\b", []tok{
+		{token.Identifier, "a", 0},
+		{token.Operator, "=", 1},
+		{token.Operator, "\\", 2},
+		{token.Identifier, "b", 3},
+	})
 }
 
 func TestComments(t *testing.T) {
@@ -280,17 +359,62 @@ func TestComments(t *testing.T) {
 		{token.Keyword, "SELECT", 0},
 		{token.Number, "1", 25},
 	})
-	// unterminated comments are not an error: the rest is a comment
-	check(t, "SELECT 1 /* open", []tok{
+	// an unterminated line comment is not an error: the rest is a comment
+	check(t, "SELECT 1 -- open", []tok{
 		{token.Keyword, "SELECT", 0},
 		{token.Number, "1", 7},
 	})
+}
+
+func TestPrecedingTrivia(t *testing.T) {
+	got, err := Tokenize("SELECT 'a'\n'b' /* c */ 'd'\n/* e */\n'f' -- g\n'h'\nx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	type flags struct {
+		text             string
+		newline, comment bool
+	}
+	want := []flags{
+		{"SELECT", false, false},
+		{"'a'", false, false},
+		{"'b'", true, false},
+		{"'d'", false, true},
+		{"'f'", true, true},
+		{"'h'", true, false},
+		// the final token bypasses PushToken upstream and never carries
+		// the flags
+		{"x", false, false},
+		{"", false, false},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("tokens = %v", got)
+	}
+	for i, w := range want {
+		g := got[i]
+		if g.Text != w.text || g.PrecededByNewline != w.newline || g.PrecededByBlockComment != w.comment {
+			t.Errorf("token %d = %q newline=%v comment=%v, want %q newline=%v comment=%v",
+				i, g.Text, g.PrecededByNewline, g.PrecededByBlockComment, w.text, w.newline, w.comment)
+		}
+	}
+	// directly appended tokens (single-byte operators) carry no flags
+	got, err = Tokenize("a\n(")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[1].PrecededByNewline {
+		t.Errorf("single-byte operator flagged: %+v", got[1])
+	}
 }
 
 func TestErrors(t *testing.T) {
 	checkErr(t, "SELECT 'abc", "unterminated string literal", 7)
 	checkErr(t, `SELECT "abc`, "unterminated quoted identifier", 7)
 	checkErr(t, `SELECT ""`, "zero-length delimited identifier", 7)
+	checkErr(t, "SELECT ``", "zero-length delimited identifier", 7)
+	checkErr(t, "SELECT `abc", "unterminated quoted identifier", 7)
+	checkErr(t, "SELECT 1 /* open", `unterminated /* comment at or near "/* open"`, 9)
+	checkErr(t, "SELECT /* a /* b */", `unterminated /* comment at or near "/* a /* b */"`, 7)
 }
 
 func TestLastTokenStates(t *testing.T) {
@@ -303,6 +427,12 @@ func TestLastTokenStates(t *testing.T) {
 	check(t, "1 =", []tok{
 		{token.Number, "1", 0},
 		{token.Operator, "=", 2},
+	})
+	// ... with the trimming rule applied
+	check(t, "a =-", []tok{
+		{token.Identifier, "a", 0},
+		{token.Operator, "=", 2},
+		{token.Operator, "-", 3},
 	})
 	// keyword state at end resolves against the keyword table
 	check(t, "SELECT", []tok{{token.Keyword, "SELECT", 0}})

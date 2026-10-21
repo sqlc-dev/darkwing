@@ -11,10 +11,14 @@ func TestLoadVendoredGrammar(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	for _, name := range []string{"Program", "TopLevelStatement", "Statement", "Expression", "List", "Parens", "EndOfInput", "%whitespace"} {
+	for _, name := range []string{"Program", "TopLevelStatement", "Statement", "Expression", "List", "Parens", "%whitespace"} {
 		if g.Rule(name) == nil {
 			t.Errorf("rule %q missing", name)
 		}
+	}
+	// EndOfInput is satisfied by a matcher rule override, not a rule
+	if g.Rule("EndOfInput") != nil {
+		t.Error("EndOfInput is a grammar rule")
 	}
 	// the keyword lists become ordered-choice rules during assembly
 	for _, list := range KeywordLists() {
@@ -40,8 +44,9 @@ func TestLoadVendoredGrammar(t *testing.T) {
 }
 
 // Every rule reference must resolve to a defined rule. EndOfInput is
-// satisfied by a rule override; %whitespace is character-level and never
-// referenced (the tokenizer handles whitespace).
+// satisfied by a rule override (upstream's CheckReference exempts it);
+// %whitespace is character-level and never referenced (the tokenizer
+// handles whitespace).
 func TestAllReferencesDefined(t *testing.T) {
 	g, err := Load()
 	if err != nil {
@@ -54,6 +59,9 @@ func TestAllReferencesDefined(t *testing.T) {
 				continue
 			}
 			if _, isParam := rule.Parameters[tok.Text]; isParam {
+				continue
+			}
+			if strings.EqualFold(tok.Text, "EndOfInput") {
 				continue
 			}
 			if g.Rule(tok.Text) == nil {
@@ -194,8 +202,8 @@ func TestParseErrors(t *testing.T) {
 		{"R <- 'A'i\n", "unexpected \"i\""},
 		{"<- 'A'\n", "expected an alpha-numeric rule name"},
 		{"R\n", "does not have a definition"},
-		// a stray ')' errors at grammar-parse time; an unbalanced '(' is
-		// only caught later, when the matcher factory compiles the rule
+		// a stray ')' errors in the character scanner; an unbalanced '('
+		// in the expression parser (TestExpressionErrors)
 		{"R <- 'A')\n", "unclosed bracket"},
 	} {
 		_, err := Parse(tc.text)
@@ -215,5 +223,64 @@ func TestParseSingleRule(t *testing.T) {
 	}
 	if _, err := ParseSingleRule("R <- 'A'\nS <- 'B'\n"); err == nil {
 		t.Error("two rules accepted by ParseSingleRule")
+	}
+}
+
+// The expression parser applies textbook PEG precedence (postfix >
+// sequence > choice); String parenthesizes every nested sequence and
+// choice.
+func TestExpressionTree(t *testing.T) {
+	for _, tc := range []struct {
+		body string
+		want string
+	}{
+		{"'A'", "'A'"},
+		{"'A' B", "'A' B"},
+		// '/' separates whole sequences
+		{"A B / C D", "(A B) / (C D)"},
+		{"A / B / C", "A / B / C"},
+		// postfix operators bind their primary only
+		{"A B*", "A B*"},
+		{"A / B?", "A / B?"},
+		{"(A B)+ C", "(A B)+ C"},
+		// a parenthesized group is always a sequence, even of one element
+		{"A (B)", "A (B)"},
+		{"A (B / C)", "A ((B / C))"},
+		// a top-level group is the rule's sequence itself
+		{"(A B)", "A B"},
+		{"(A)", "A"},
+		{"List(A B / C)", "List((A B) / C)"},
+		{"Parens(List(A))", "Parens(List(A))"},
+		// negative lookahead is parsed but ignored
+		{"!A B", "A B"},
+		// an empty alternative is an empty sequence
+		{"A / ", "A / ()"},
+	} {
+		g, err := Parse("R <- " + tc.body + "\n")
+		if err != nil {
+			t.Errorf("Parse(%q): %v", tc.body, err)
+			continue
+		}
+		if got := g.Rule("R").Expression.String(); got != tc.want {
+			t.Errorf("Parse(%q) = %s, want %s", tc.body, got, tc.want)
+		}
+	}
+}
+
+func TestExpressionErrors(t *testing.T) {
+	for _, tc := range []struct {
+		text string
+		want string
+	}{
+		// an unbalanced '(' runs the rule to the end of the grammar
+		{"R <- ('A'\n", "expected closing ')'"},
+		{"R <- List('A'\n", "expected closing ')' after function call 'List'"},
+		{"R <- ? 'A'\n", "unrecognized peg token type"},
+		{"R <- 'A' !\n", "unexpected end of PEG rule tokens"},
+	} {
+		_, err := Parse(tc.text)
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("Parse(%q) err = %v, want containing %q", tc.text, err, tc.want)
+		}
 	}
 }

@@ -1,8 +1,10 @@
 // Package matcher compiles the loaded PEG grammar into a matcher tree and
 // matches token streams against it, producing a generic parse tree
-// (ParseResult). It is a port of DuckDB's matcher_factory.cpp, matcher.cpp,
-// parser_packrat.cpp and the matcher/*.hpp headers, minus the autocomplete
-// suggestion machinery (out of scope for darkwing).
+// (ParseResult). It is a port of DuckDB's matcher_factory.cpp,
+// matcher_process.cpp, matcher_stack.cpp, compiled_grammar.cpp (the rule
+// override table), parser_packrat.cpp and the matcher/*.hpp headers, minus
+// the autocomplete suggestion machinery (out of scope for darkwing) and
+// the FIRST-set pruning (matcher_first_set.cpp), a pure optimization.
 package matcher
 
 import (

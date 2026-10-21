@@ -190,7 +190,7 @@ hand; rerun the tool instead (see PLAN.md, § Conformance oracle and corpus).
 
 - Source: DuckDB test/sql/**/*.test and test/fuzzer/**/*.test
 - Pinned commit: %s
-- Oracle: DuckDB CLI %s (nightly build of the pinned commit)
+- Oracle: DuckDB CLI %s (release build of the pinned commit)
 - Files: %d, cases: %d (%d must-accept, %d must-reject)
 - Statements without an observed verdict (oracle timeout/crash): %d, dropped
 

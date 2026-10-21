@@ -15,8 +15,8 @@ const (
 	// Keyword is a bare word that appears in one of the keyword lists.
 	Keyword
 	// String is a string literal, including prefixed (E'...', X'...',
-	// N'...', B'...') and dollar-quoted forms (already normalized to a
-	// plain quoted literal by the tokenizer, as upstream does).
+	// N'...', B'...') and dollar-quoted forms (kept raw; the string
+	// literal matcher strips the delimiters).
 	String
 	// Number is a numeric literal.
 	Number
@@ -67,10 +67,8 @@ type Span struct {
 	End   int
 }
 
-// Token is a single lexical token. Text is the raw source slice except for
-// dollar-quoted strings, which the tokenizer rewrites to an equivalent
-// plain quoted literal while Span still covers the original source (the
-// same behavior as upstream's MatcherToken).
+// Token is a single lexical token: Text is the raw source slice. Port of
+// upstream's MatcherToken.
 type Token struct {
 	Kind Kind
 	Text string
@@ -78,6 +76,14 @@ type Token struct {
 	// Unterminated marks a token that ran into end of input (an unclosed
 	// dollar-quoted string).
 	Unterminated bool
+	// PrecededByNewline reports a newline between the previous token and
+	// this one; PrecededByBlockComment reports a /* */ comment there. They
+	// decide string literal continuation ('a'<newline>'b' is 'ab').
+	// Upstream sets both only for tokens that go through
+	// TokenizerBehavior::PushToken, so single-byte operators, terminators
+	// and the final token of the input never carry them.
+	PrecededByNewline      bool
+	PrecededByBlockComment bool
 }
 
 func (t Token) String() string {

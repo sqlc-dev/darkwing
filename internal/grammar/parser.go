@@ -29,14 +29,18 @@ type Token struct {
 }
 
 // Rule is a parsed grammar rule: a name, optional parameters (for macros
-// such as List(D)), and the flat token stream of its definition. Port of
+// such as List(D)), and its definition as an expression tree. Port of
 // duckdb PEGRule.
 type Rule struct {
 	Name string
 	// Parameters maps parameter name to position. Upstream supports at most
 	// one parameter per rule; the matcher factory enforces that.
 	Parameters map[string]int
-	Tokens     []Token
+	// Tokens is the flat token stream of the definition, the input of the
+	// expression parser (upstream discards it once the tree is built).
+	Tokens []Token
+	// Expression is the definition's expression tree.
+	Expression *Expression
 }
 
 // Grammar is an immutable set of parsed rules, keyed case-insensitively by
@@ -70,8 +74,8 @@ func (g *Grammar) addRule(rule *Rule) error {
 // Parse parses PEG grammar text into rules. It is a direct port of duckdb
 // PEGParser::ParseRules (peg_parser.cpp): a small state machine over the
 // characters of the grammar text that produces, per rule, a flat token
-// stream. Structure (grouping, choice, repetition) is interpreted later by
-// the matcher factory, exactly as upstream does.
+// stream, which the expression parser (expression.go) then turns into the
+// rule's expression tree.
 func Parse(text string) (*Grammar, error) {
 	p := &pegParser{grammar: &Grammar{rules: make(map[string]*Rule)}}
 	if err := p.parseRules(text); err != nil {
@@ -146,8 +150,7 @@ func (p *pegParser) parseRules(grammar string) error {
 		if state == stateRuleDefinition && isNewline(grammar[c]) && bracketCount == 0 &&
 			!inOrClause && len(rule.Tokens) > 0 {
 			// a newline while parsing a rule definition completes the rule
-			rule.Name = ruleName
-			if err := p.grammar.addRule(rule); err != nil {
+			if err := p.completeRule(ruleName, rule); err != nil {
 				return err
 			}
 			rule = &Rule{}
@@ -291,10 +294,22 @@ func (p *pegParser) parseRules(grammar string) error {
 		if len(rule.Tokens) == 0 {
 			return fmt.Errorf("failed to parse grammar - rule %s is empty", ruleName)
 		}
-		rule.Name = ruleName
-		if err := p.grammar.addRule(rule); err != nil {
+		if err := p.completeRule(ruleName, rule); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// completeRule builds the expression tree of a finished rule and adds it
+// to the grammar (upstream: PEGRule(parameters, BuildExpression(tokens))
+// followed by PEGParser::AddRule).
+func (p *pegParser) completeRule(name string, rule *Rule) error {
+	rule.Name = name
+	expr, err := buildExpression(rule.Tokens)
+	if err != nil {
+		return err
+	}
+	rule.Expression = expr
+	return p.grammar.addRule(rule)
 }

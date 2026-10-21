@@ -61,14 +61,7 @@ func (tc *transformContext) applyGenericOptionValue(opt *ast.GenericOption, n tn
 	case "GenericCopyOptionOrderList":
 		// Parens(OrderByExpressionList): a parenthesized argument list,
 		// parsed as order-by entries so ORDER_BY can carry modifiers.
-		var orders []ast.OrderByNode
-		for _, e := range alt.sole().parens().listElems() {
-			orders = append(orders, ast.OrderByNode{
-				Type:       orderTypeOf(e.child(1)),
-				NullOrder:  nullOrderOf(e.child(2)),
-				Expression: tc.transformExpression(e.child(0)),
-			})
-		}
+		orders := tc.genericOptionOrders(alt)
 		hasModifier := false
 		for _, o := range orders {
 			if o.Type != ast.OrderDefault || o.NullOrder != ast.NullOrderDefault {
@@ -97,6 +90,20 @@ func (tc *transformContext) applyGenericOptionValue(opt *ast.GenericOption, n tn
 	}
 }
 
+// genericOptionOrders maps GenericCopyOptionOrderList
+// (GenericCopyOptionParenthesizedExpressionList <- Parens(OrderByExpressionList)).
+func (tc *transformContext) genericOptionOrders(n tnode) []ast.OrderByNode {
+	var orders []ast.OrderByNode
+	for _, e := range n.sole().sole().parens().listElems() {
+		orders = append(orders, ast.OrderByNode{
+			Type:       orderTypeOf(e.child(1)),
+			NullOrder:  nullOrderOf(e.child(2)),
+			Expression: tc.transformExpression(e.child(0)),
+		})
+	}
+	return orders
+}
+
 func orderExprs(orders []ast.OrderByNode) []ast.Expr {
 	out := make([]ast.Expr, len(orders))
 	for i := range orders {
@@ -111,19 +118,54 @@ func rowFunction(args []ast.Expr) *ast.FunctionExpression {
 
 // transformGenericOption maps GenericCopyOption <- CopyOptionName GenericCopyOptionValue?
 func (tc *transformContext) transformGenericOption(n tnode) ast.GenericOption {
-	opt := ast.GenericOption{Name: strings.ToLower(identifierText(n.child(0)))}
-	if value, ok := n.child(1).opt(); ok {
-		tc.applyGenericOptionValue(&opt, value)
+	return tc.buildGenericOption(strings.ToLower(identifierText(n.child(0))), n.child(1))
+}
+
+// buildGenericOption ports BuildGenericCopyOption: PARTITION_PATH keeps
+// its single expression as-is (it binds against the partition columns);
+// every other option folds its value via applyGenericOptionValue.
+func (tc *transformContext) buildGenericOption(name string, valueNode tnode) ast.GenericOption {
+	opt := ast.GenericOption{Name: name}
+	value, hasValue := valueNode.opt()
+	isPartitionPath := strings.EqualFold(name, "partition_path")
+	if !hasValue {
+		if isPartitionPath {
+			raise("PARTITION_PATH expects an expression")
+		}
+		return opt
 	}
+	if isPartitionPath {
+		_, alt := value.sole().choice()
+		if alt.name() == "GenericCopyOptionExpression" {
+			opt.Expr = tc.transformExpression(alt.sole())
+			return opt
+		}
+		// an expression wrapped in () parses as an order list
+		orders := tc.genericOptionOrders(alt)
+		if len(orders) != 1 || orders[0].Type != ast.OrderDefault || orders[0].NullOrder != ast.NullOrderDefault {
+			raise("PARTITION_PATH expects a single expression")
+		}
+		opt.Expr = orders[0].Expression
+		return opt
+	}
+	tc.applyGenericOptionValue(&opt, value)
 	return opt
 }
 
 // transformGenericOptionList unwraps GenericCopyOptionList
-// (Parens(List(GenericCopyOption))).
+// (Parens(List(GenericCopyOption))); option names may not repeat
+// (TransformGenericCopyOptionList; names are already lower-cased).
 func (tc *transformContext) transformGenericOptionList(n tnode) []ast.GenericOption {
 	var out []ast.GenericOption
 	for _, o := range n.parens().listElems() {
 		out = append(out, tc.transformGenericOption(o))
+	}
+	seen := map[string]bool{}
+	for _, o := range out {
+		if seen[o.Name] {
+			raise("Unexpected duplicate option %s", quotedIdent(o.Name))
+		}
+		seen[o.Name] = true
 	}
 	return out
 }
@@ -160,18 +202,10 @@ func (tc *transformContext) transformCopyGenericOption(n tnode) ast.GenericOptio
 	switch alt.name() {
 	case "OrderByCopyOption":
 		// 'ORDER' 'BY' GenericCopyOptionValue?
-		opt := ast.GenericOption{Name: "order_by"}
-		if value, ok := alt.child(2).opt(); ok {
-			tc.applyGenericOptionValue(&opt, value)
-		}
-		return opt
+		return tc.buildGenericOption("order_by", alt.child(2))
 	case "PartitionedByCopyOption":
 		// ('PARTITION' / 'PARTITIONED') 'BY' GenericCopyOptionValue?
-		opt := ast.GenericOption{Name: "partition_by"}
-		if value, ok := alt.child(2).opt(); ok {
-			tc.applyGenericOptionValue(&opt, value)
-		}
-		return opt
+		return tc.buildGenericOption("partition_by", alt.child(2))
 	case "GenericCopyOption":
 		return tc.transformGenericOption(alt)
 	}
@@ -283,7 +317,7 @@ func setCopyOptions(info *ast.CopyInfo, opts []ast.GenericOption) {
 		}
 		key := strings.ToLower(opts[i].Name)
 		if seen[key] {
-			raise("Unexpected duplicate option %s", opts[i].Name)
+			raise("Unexpected duplicate option %s", quotedIdent(opts[i].Name))
 		}
 		seen[key] = true
 	}
@@ -342,14 +376,22 @@ func (tc *transformContext) transformCopyFileName(n tnode) (string, ast.Expr) {
 		return identifierText(alt.sole()), nil
 	case "CopyFileNameIdentifier":
 		id := identifierText(alt.sole())
-		if strings.EqualFold(id, "stdout") {
+		switch {
+		case strings.EqualFold(id, "stdin"):
+			return "/dev/stdin", nil
+		case strings.EqualFold(id, "stdout"):
 			return "/dev/stdout", nil
 		}
 		return id, nil
 	case "CopyFileNameIdentifierColId":
-		// IdentifierColId <- Identifier '.' ColId
+		// IdentifierColId <- Identifier CopyFileNameSuffix+
+		// CopyFileNameSuffix <- '.' ColId
 		ic := alt.sole()
-		return identifierText(ic.child(0)) + "." + identifierText(ic.child(2)), nil
+		path := identifierText(ic.child(0))
+		for _, suffix := range ic.child(1).repeat() {
+			path += "." + identifierText(suffix.child(1))
+		}
+		return path, nil
 	}
 	shapeError(alt, "unknown copy file name")
 	return "", nil
@@ -371,7 +413,10 @@ func (tc *transformContext) transformCopy(n tnode) ast.Stmt {
 	return nil
 }
 
-// CopyTable <- BaseTableName InsertColumnList? FromOrTo CopyFileName CopyOptions?
+// CopyTable <- BaseTableName InsertColumnList? FromOrTo CopyFileName
+// CopyLegacyOption? CopyOptions?
+// CopyLegacyOption <- 'USING'? 'DELIMITERS' StringLiteral is a leading
+// delimiter option.
 func (tc *transformContext) transformCopyTable(n tnode, sp ast.Span) ast.Stmt {
 	info := &ast.CopyInfo{}
 	info.SetSpan(n.span())
@@ -386,8 +431,15 @@ func (tc *transformContext) transformCopyTable(n tnode, sp ast.Span) ast.Stmt {
 	info.IsFrom = fromTo.name() == "CopyFrom"
 	info.FilePath, info.FilePathExpr = tc.transformCopyFileName(n.child(3))
 	info.Format = extractFormat(info.FilePath)
-	if opts, ok := n.child(4).opt(); ok {
-		setCopyOptions(info, tc.transformCopyOptions(opts))
+	var opts []ast.GenericOption
+	if legacy, ok := n.child(4).opt(); ok {
+		opts = append(opts, ast.GenericOption{Name: "delimiter", Values: []ast.Value{varcharValue(identifierText(legacy.child(2)))}})
+	}
+	if o, ok := n.child(5).opt(); ok {
+		opts = append(opts, tc.transformCopyOptions(o)...)
+	}
+	if len(opts) > 0 {
+		setCopyOptions(info, opts)
 	}
 	stmt := &ast.CopyStatement{Info: info}
 	stmt.SetSpan(sp)

@@ -169,6 +169,8 @@ type CreateTableInfo struct {
 	Query *SelectStatement `json:"query,omitempty"`
 	// QueryAliases are the CTAS column aliases (`CREATE TABLE t (a, b) AS`).
 	QueryAliases []string `json:"query_aliases,omitempty"`
+	// Options is the WITH (...) option list.
+	Options []RelOption `json:"options,omitempty"`
 }
 
 func (i *CreateTableInfo) Children() []Node {
@@ -179,25 +181,44 @@ func (i *CreateTableInfo) Children() []Node {
 	for _, c := range i.Constraints {
 		nodes = add(nodes, c)
 	}
-	return add(nodes, i.Query)
+	return relOptionExprs(add(nodes, i.Query), i.Options)
+}
+
+// RelOption is one WITH (name = value) entry (upstream's RelOptionList,
+// a case-insensitive option map). A bare name carries a NULL constant.
+type RelOption struct {
+	Name  string `json:"name"`
+	Value Expr   `json:"value,omitempty"`
+}
+
+func relOptionExprs(nodes []Node, opts []RelOption) []Node {
+	for _, o := range opts {
+		nodes = add(nodes, o.Value)
+	}
+	return nodes
 }
 
 // CreateViewInfo is CREATE VIEW. Port of CreateViewInfo.
 type CreateViewInfo struct {
 	CreateInfoBase
+	// Secure is CREATE SECURE VIEW (upstream's ViewSecurityType).
+	Secure    bool             `json:"secure,omitempty"`
 	Recursive bool             `json:"recursive,omitempty"`
 	Aliases   []string         `json:"aliases,omitempty"`
+	Options   []RelOption      `json:"options,omitempty"`
 	Query     *SelectStatement `json:"query"`
 }
 
-func (i *CreateViewInfo) Children() []Node { return add(nil, i.Query) }
+func (i *CreateViewInfo) Children() []Node { return add(relOptionExprs(nil, i.Options), i.Query) }
 
 // CreateSchemaInfo is CREATE SCHEMA. Port of CreateSchemaInfo.
 type CreateSchemaInfo struct {
 	CreateInfoBase
+	// Options is the WITH (...) option list.
+	Options []RelOption `json:"options,omitempty"`
 }
 
-func (i *CreateSchemaInfo) Children() []Node { return nil }
+func (i *CreateSchemaInfo) Children() []Node { return relOptionExprs(nil, i.Options) }
 
 // IndexElement is one indexed expression with its ordering.
 type IndexElement struct {
@@ -215,6 +236,7 @@ type CreateIndexInfo struct {
 	// verbatim here).
 	IndexType string         `json:"index_type,omitempty"`
 	Elements  []IndexElement `json:"elements,omitempty"`
+	Options   []RelOption    `json:"options,omitempty"`
 	Where     Expr           `json:"where,omitempty"`
 }
 
@@ -223,7 +245,7 @@ func (i *CreateIndexInfo) Children() []Node {
 	for j := range i.Elements {
 		nodes = add(nodes, i.Elements[j].Expr)
 	}
-	return add(nodes, i.Where)
+	return relOptionExprs(add(nodes, i.Where), i.Options)
 }
 
 // CreateSequenceInfo is CREATE SEQUENCE. Port of CreateSequenceInfo.
@@ -251,7 +273,8 @@ func (i *CreateSequenceInfo) Children() []Node {
 // CreateTypeInfo is CREATE TYPE. Port of CreateTypeInfo.
 type CreateTypeInfo struct {
 	CreateInfoBase
-	// Type is the aliased type (`CREATE TYPE t AS <type>`).
+	// Type is the aliased type (`CREATE TYPE t AS <type>`), or for
+	// `AS ENUM (...)[]` the list/array wrapping of the enum.
 	Type *TypeExpression `json:"type,omitempty"`
 	// EnumValues is `AS ENUM ('a', 'b')`.
 	EnumValues []string `json:"enum_values,omitempty"`
@@ -370,9 +393,10 @@ func (a *DropColumnInfo) Children() []Node { return nil }
 // AlterColumnTypeInfo is ALTER TABLE ALTER COLUMN ... [SET DATA] TYPE.
 type AlterColumnTypeInfo struct {
 	alterInfoBase
-	Column []string        `json:"column"`
-	Type   *TypeExpression `json:"type,omitempty"`
-	Using  Expr            `json:"using,omitempty"`
+	Column    []string        `json:"column"`
+	Type      *TypeExpression `json:"type,omitempty"`
+	Collation string          `json:"collation,omitempty"`
+	Using     Expr            `json:"using,omitempty"`
 }
 
 func (a *AlterColumnTypeInfo) Children() []Node {
@@ -449,8 +473,22 @@ func (a *SetDatabaseAliasInfo) Children() []Node { return nil }
 type GenericAlterInfo struct {
 	alterInfoBase
 	// Kind names the option (e.g. "SET_PARTITIONED_BY").
-	Kind        string `json:"kind"`
-	Expressions []Expr `json:"expressions,omitempty"`
+	Kind        string      `json:"kind"`
+	Expressions []Expr      `json:"expressions,omitempty"`
+	Options     []RelOption `json:"options,omitempty"`
 }
 
-func (a *GenericAlterInfo) Children() []Node { return exprs(a.Expressions) }
+func (a *GenericAlterInfo) Children() []Node {
+	return relOptionExprs(exprs(a.Expressions), a.Options)
+}
+
+// DropConstraintInfo is ALTER TABLE DROP CONSTRAINT (parsed upstream,
+// then rejected as not implemented after parsing).
+type DropConstraintInfo struct {
+	alterInfoBase
+	IfExists bool   `json:"if_exists,omitempty"`
+	Name     string `json:"name"`
+	Cascade  bool   `json:"cascade,omitempty"`
+}
+
+func (a *DropConstraintInfo) Children() []Node { return nil }

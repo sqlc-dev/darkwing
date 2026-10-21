@@ -261,14 +261,33 @@ func (s *ExplainStatement) Children() []Node { return add(nil, s.Statement) }
 type AttachStatement struct {
 	stmtBase
 	// Path is the database path expression (usually a string constant).
-	Path        Expr             `json:"path"`
-	Alias       string           `json:"alias,omitempty"`
-	OnConflict  OnCreateConflict `json:"on_conflict"`
-	Options     []GenericOption  `json:"options,omitempty"`
-	NamedParams []NamedParam     `json:"named_param_map,omitempty"`
+	Path       Expr             `json:"path"`
+	Alias      string           `json:"alias,omitempty"`
+	OnConflict OnCreateConflict `json:"on_conflict"`
+	Options    []GenericOption  `json:"options,omitempty"`
+	// ExternalResource is ATTACH TO [NEW TEMPORARY] EXTERNAL RESOURCE
+	// (Path is nil then).
+	ExternalResource *ExternalResourceSource `json:"external_resource,omitempty"`
+	NamedParams      []NamedParam            `json:"named_param_map,omitempty"`
 }
 
-func (s *AttachStatement) Children() []Node { return optionExprs(add(nil, s.Path), s.Options) }
+func (s *AttachStatement) Children() []Node {
+	nodes := optionExprs(add(nil, s.Path), s.Options)
+	if s.ExternalResource != nil {
+		nodes = optionExprs(nodes, s.ExternalResource.Params)
+	}
+	return nodes
+}
+
+// ExternalResourceSource is the resource an ATTACH TO / CONNECT TO
+// statement targets. Port of ExternalResourceOptions: NEW TEMPORARY
+// EXTERNAL RESOURCE 'provider' (params) provisions one; EXTERNAL
+// RESOURCE name borrows a registered one.
+type ExternalResourceSource struct {
+	Provider      string          `json:"provider,omitempty"`
+	Params        []GenericOption `json:"params,omitempty"`
+	ReferenceName string          `json:"reference_name,omitempty"`
+}
 
 // DetachStatement is DETACH [DATABASE] [IF EXISTS] name. Port of
 // DetachStatement/DetachInfo.
@@ -290,10 +309,18 @@ type ConnectStatement struct {
 	// NameIsString marks a string-literal target.
 	NameIsString bool            `json:"name_is_string,omitempty"`
 	Options      []GenericOption `json:"options,omitempty"`
-	NamedParams  []NamedParam    `json:"named_param_map,omitempty"`
+	// ExternalResource is CONNECT TO [NEW TEMPORARY] EXTERNAL RESOURCE.
+	ExternalResource *ExternalResourceSource `json:"external_resource,omitempty"`
+	NamedParams      []NamedParam            `json:"named_param_map,omitempty"`
 }
 
-func (s *ConnectStatement) Children() []Node { return optionExprs(nil, s.Options) }
+func (s *ConnectStatement) Children() []Node {
+	nodes := optionExprs(nil, s.Options)
+	if s.ExternalResource != nil {
+		nodes = optionExprs(nodes, s.ExternalResource.Params)
+	}
+	return nodes
+}
 
 // DisconnectStatement is DISCONNECT. Port of DisconnectStatement.
 type DisconnectStatement struct {
@@ -310,22 +337,36 @@ const (
 	LoadTypeLoadAs       LoadKind = "LOAD_AS"
 	LoadTypeInstall      LoadKind = "INSTALL"
 	LoadTypeForceInstall LoadKind = "FORCE_INSTALL"
+	// LoadTypeCreateRepository / LoadTypeDropRepository are CREATE /
+	// DROP EXTENSION REPOSITORY (LoadType::CREATE_REPOSITORY etc.).
+	LoadTypeCreateRepository LoadKind = "CREATE_REPOSITORY"
+	LoadTypeDropRepository   LoadKind = "DROP_REPOSITORY"
 )
 
-// LoadStatement is LOAD / INSTALL / FORCE INSTALL. Port of
-// LoadStatement/LoadInfo (upstream models INSTALL as a load kind).
+// LoadStatement is LOAD / INSTALL / FORCE INSTALL / CREATE and DROP
+// EXTENSION REPOSITORY. Port of LoadStatement/LoadInfo (upstream models
+// INSTALL and the repository statements as load kinds).
 type LoadStatement struct {
 	stmtBase
 	Kind LoadKind `json:"kind"`
 	// Name is the extension name or filename.
-	Name string `json:"name"`
+	Name string `json:"name,omitempty"`
 	// Alias is LOAD ... AS alias.
 	Alias string `json:"alias,omitempty"`
-	// Repository is INSTALL ... FROM <repo>; RepoIsAlias marks the
+	// Repository is [INSTALL|LOAD] ... FROM <repo> (or the repository
+	// name of the repository statements); RepoIsAlias marks the
 	// identifier (alias) form as opposed to a literal URL.
 	Repository  string `json:"repository,omitempty"`
 	RepoIsAlias bool   `json:"repo_is_alias,omitempty"`
 	Version     string `json:"version,omitempty"`
+	// LoadAfterInstall is INSTALL AND LOAD.
+	LoadAfterInstall bool `json:"load_after_install,omitempty"`
+	// RepositoryURL, PublicKeys and OnConflict belong to CREATE EXTENSION
+	// REPOSITORY; MissingOK to DROP EXTENSION REPOSITORY IF EXISTS.
+	RepositoryURL string           `json:"repository_url,omitempty"`
+	PublicKeys    []string         `json:"public_keys,omitempty"`
+	OnConflict    OnCreateConflict `json:"on_conflict,omitempty"`
+	MissingOK     bool             `json:"missing_ok,omitempty"`
 }
 
 func (s *LoadStatement) Children() []Node { return nil }

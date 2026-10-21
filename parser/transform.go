@@ -38,6 +38,9 @@ type transformContext struct {
 	// parameters had been seen when such an entry was recorded.
 	pivotEntries        int
 	pivotEntryHasParams bool
+	// pivotFirstColumn renders the first such entry's pivot column
+	// (pivot_entries[0]->column->ToString()) for pivotEntryCheck.
+	pivotFirstColumn string
 }
 
 // pivotEntryCheck ports PEGTransformer::PivotEntryCheck: CREATE VIEW and
@@ -47,7 +50,7 @@ func (tc *transformContext) pivotEntryCheck(kind string) {
 	if tc.pivotEntries > 0 {
 		raise("PIVOT statements with pivot elements extracted from the data cannot be used in %ss.\n"+
 			"In order to use PIVOT in a %s the PIVOT values must be manually specified, e.g.:\n"+
-			"PIVOT ... ON ... IN (val1, val2, ...)", kind, kind)
+			"PIVOT ... ON %s IN (val1, val2, ...)", kind, kind, tc.pivotFirstColumn)
 	}
 }
 
@@ -74,6 +77,7 @@ func register(rule string, fn stmtTransform) {
 // wrapping a choice of statement rules).
 func (tc *transformContext) transformStatement(n tnode) ast.Stmt {
 	_, inner := n.sole().choice()
+	checkExpressionDepth(inner.r)
 	if fn, ok := statementTransforms[inner.name()]; ok {
 		return fn(tc, inner)
 	}

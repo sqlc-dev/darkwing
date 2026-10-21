@@ -215,6 +215,7 @@ func (tc *transformContext) transformLogicalNot(n tnode) ast.Expr {
 // through end.
 func applyNotKeywords(notNode tnode, expr ast.Expr, end int) ast.Expr {
 	nots := notNode.sole().repeat()
+	stackCheck(len(nots))
 	for i := len(nots) - 1; i >= 0; i-- {
 		expr = notExpr(ast.Span{Start: nots[i].sole().span().Start, End: end}, expr)
 	}
@@ -945,6 +946,7 @@ func (tc *transformContext) transformBitwise(n tnode) ast.Expr {
 func (tc *transformContext) transformTilde(n tnode) ast.Expr {
 	expr := tc.transformAdditive(n.child(1))
 	ops := n.child(0).repeat()
+	stackCheck(len(ops))
 	for i := len(ops) - 1; i >= 0; i-- {
 		sp := invalidSpan
 		if i == 0 {

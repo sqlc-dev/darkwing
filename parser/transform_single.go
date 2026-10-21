@@ -599,7 +599,7 @@ func (tc *transformContext) transformStar(n tnode) ast.Expr {
 			path := excludeNamePath(e)
 			for _, prev := range excludePaths {
 				if qualifiedColumnsMatch(prev, path) {
-					raise("Duplicate entry \"%s\" in EXCLUDE list", strings.Join(path, "."))
+					raise("Duplicate entry \"%s\" in EXCLUDE list", qualifiedColumnText(path))
 				}
 			}
 			excludePaths = append(excludePaths, path)
@@ -645,7 +645,7 @@ func (tc *transformContext) transformStar(n tnode) ast.Expr {
 		}
 		for _, r := range star.ReplaceList {
 			if inExclude([]string{r.Key}) {
-				raise("Column \"%s\" cannot occur in both EXCLUDE and REPLACE list", r.Key)
+				raise("Column \"%s\" cannot occur in both EXCLUDE and REPLACE list", quoteIdent(r.Key))
 			}
 		}
 	}
@@ -668,10 +668,10 @@ func (tc *transformContext) transformStar(n tnode) ast.Expr {
 		}
 		for _, r := range star.RenameList {
 			if inExclude(r.Key.Path) {
-				raise("Column \"%s\" cannot occur in both EXCLUDE and RENAME list", strings.Join(r.Key.Path, "."))
+				raise("Column \"%s\" cannot occur in both EXCLUDE and RENAME list", qualifiedColumnText(r.Key.Path))
 			}
 			if replaced[strings.ToLower(r.Key.Path[len(r.Key.Path)-1])] {
-				raise("Column \"%s\" cannot occur in both REPLACE and RENAME list", strings.Join(r.Key.Path, "."))
+				raise("Column \"%s\" cannot occur in both REPLACE and RENAME list", qualifiedColumnText(r.Key.Path))
 			}
 		}
 	}
@@ -712,12 +712,27 @@ func excludeNamePath(n tnode) []string {
 		for _, dot := range d.child(1).repeat() {
 			path = append(path, identifierText(dot.child(1)))
 		}
+		if len(path) > 4 {
+			// StringToQualifiedColumnName
+			raise("Expected at most 4 entries (catalog.schema.table.column), but found %d entries (input: %s)",
+				len(path), strings.Join(path, "."))
+		}
 		return path
 	case "ExcludeColumnName":
 		return []string{identifierText(alt.sole())}
 	}
 	shapeError(alt, "unknown exclude name")
 	return nil
+}
+
+// qualifiedColumnText ports QualifiedColumnName::ToString: each part
+// rendered with SQLIdentifier (quoted only when required).
+func qualifiedColumnText(path []string) string {
+	parts := make([]string, len(path))
+	for i, p := range path {
+		parts[i] = sqlIdentifier(p)
+	}
+	return strings.Join(parts, ".")
 }
 
 // ---- column references -------------------------------------------------

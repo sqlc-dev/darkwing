@@ -875,6 +875,9 @@ func (tc *transformContext) transformPivotStatement(n tnode) ast.QueryNode {
 		// matching upstream's transform order.
 		for _, col := range ref.Pivots {
 			if col.PivotEnum == "" && len(col.Entries) == 0 && len(col.PivotExpressions) > 0 {
+				if tc.pivotEntries == 0 {
+					tc.pivotFirstColumn = tc.exprText(col.PivotExpressions[0])
+				}
 				tc.pivotEntries++
 				if tc.paramCount > 0 || tc.hasNamed || tc.hasPosition {
 					tc.pivotEntryHasParams = true
@@ -975,6 +978,20 @@ func (tc *transformContext) exprSourceText(e ast.Expr) string {
 		return tc.src[start:end]
 	}
 	return constantText(e)
+}
+
+// exprText renders an expression for an error message: a column
+// reference as ColumnRefExpression::ToString (SQLIdentifier parts), any
+// other expression via its source text (exprSourceText).
+func (tc *transformContext) exprText(e ast.Expr) string {
+	if ref, ok := e.(*ast.ColumnRefExpression); ok {
+		parts := make([]string, len(ref.ColumnNames))
+		for i, p := range ref.ColumnNames {
+			parts[i] = sqlIdentifier(p)
+		}
+		return strings.Join(parts, ".")
+	}
+	return tc.exprSourceText(e)
 }
 
 // PivotColumnEntry <- PivotColumnSubquery / PivotValueList / PivotColumnExpression

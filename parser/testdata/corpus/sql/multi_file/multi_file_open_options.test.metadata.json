@@ -1,0 +1,11 @@
+{
+  "todo": {
+    "18c0d69902e3b0c3": "oracle's Parser Error comes from outside the parse pipeline (bind-time setting/function/constraint validation or nested SQL parsing); darkwing accepts by design - revisit with milestone 6 error-fidelity work",
+    "47494e6a333e8a6c": "oracle's Parser Error comes from outside the parse pipeline (bind-time setting/function/constraint validation or nested SQL parsing); darkwing accepts by design - revisit with milestone 6 error-fidelity work",
+    "89f877531bd62a57": "oracle's Parser Error comes from outside the parse pipeline (bind-time setting/function/constraint validation or nested SQL parsing); darkwing accepts by design - revisit with milestone 6 error-fidelity work",
+    "972714fb967fe4fa": "oracle's Parser Error comes from outside the parse pipeline (bind-time setting/function/constraint validation or nested SQL parsing); darkwing accepts by design - revisit with milestone 6 error-fidelity work",
+    "b0e0efc69f7c1576": "oracle's Parser Error comes from outside the parse pipeline (bind-time setting/function/constraint validation or nested SQL parsing); darkwing accepts by design - revisit with milestone 6 error-fidelity work",
+    "d3953e46300510c8": "oracle's Parser Error comes from outside the parse pipeline (bind-time setting/function/constraint validation or nested SQL parsing); darkwing accepts by design - revisit with milestone 6 error-fidelity work",
+    "f457823f7898e6e1": "oracle's Parser Error comes from outside the parse pipeline (bind-time setting/function/constraint validation or nested SQL parsing); darkwing accepts by design - revisit with milestone 6 error-fidelity work"
+  }
+}

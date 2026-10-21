@@ -31,6 +31,16 @@ const (
 // EnvBinary is the environment variable naming the pinned CLI binary.
 const EnvBinary = "DARKWING_DUCKDB"
 
+// Env returns the environment for running the CLI: the current one with
+// agent mode forced off. Since v2.0.0 the CLI switches to a JSON/markdown
+// "agent mode" output format when its stdout is a pipe and it detects a
+// coding agent in the environment (AI_AGENT, CLAUDECODE, ...), which would
+// change the error lines the oracle classifies; DUCKDB_AGENT_MODE=0
+// overrides the detection (ShellState::DetectAgentMode in shell.cpp).
+func Env() []string {
+	return append(os.Environ(), "DUCKDB_AGENT_MODE=0")
+}
+
 // Find locates the pinned DuckDB CLI: $DARKWING_DUCKDB, or "duckdb" on
 // PATH. The binary's version is verified against the pin.
 func Find() (string, error) {
@@ -52,7 +62,9 @@ func Find() (string, error) {
 // Verify checks that the binary at path reports the pinned version and
 // commit.
 func Verify(path string) error {
-	out, err := exec.Command(path, "--version").Output()
+	cmd := exec.Command(path, "--version")
+	cmd.Env = Env()
+	out, err := cmd.Output()
 	if err != nil {
 		return fmt.Errorf("running %s --version: %w", path, err)
 	}
@@ -115,6 +127,7 @@ func (o *Oracle) Run(sql string) (Verdict, error) {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, o.Binary, "-batch", "-noheader", ":memory:")
+	cmd.Env = Env()
 	cmd.Dir = o.Dir
 	if cmd.Dir == "" {
 		cmd.Dir = os.TempDir()

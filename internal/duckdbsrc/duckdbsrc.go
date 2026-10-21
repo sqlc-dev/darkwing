@@ -19,14 +19,13 @@ import (
 // Pinned build identity. Advancing the pin means updating these alongside
 // the vendored grammar and regenerated corpus.
 const (
-	// PinnedCommit is the DuckDB source commit of the pin.
-	PinnedCommit = "8cbdaba6acb50db7780d22a65dd131584d472262"
-	// PinnedVersion is the CLI version string of the matching nightly.
-	PinnedVersion = "v2.0.0-alpha38195"
-	// NightlyURL is where DuckDB serves the current nightly CLI bundle.
-	// "latest" moves: once it no longer matches PinnedCommit, the pin
-	// must be advanced (or a cached binary used).
-	NightlyURL = "https://artifacts.duckdb.org/latest/duckdb-binaries-linux-amd64.zip"
+	// PinnedCommit is the DuckDB source commit of the pin (the v2.0.0 tag).
+	PinnedCommit = "d54cbbe3df17e8e5ce68312f483b4155836112aa"
+	// PinnedVersion is the CLI version string of the pinned release.
+	PinnedVersion = "v2.0.0"
+	// ReleaseURL is where DuckDB serves the pinned release's CLI. Unlike
+	// the nightly bundle a tagged release never moves.
+	ReleaseURL = "https://github.com/duckdb/duckdb/releases/download/v2.0.0/duckdb_cli-linux-amd64.zip"
 )
 
 // EnvBinary is the environment variable naming the pinned CLI binary.
@@ -40,7 +39,7 @@ func Find() (string, error) {
 		p, err := exec.LookPath("duckdb")
 		if err != nil {
 			return "", fmt.Errorf("pinned DuckDB CLI not found: set %s or put duckdb on PATH (want %s @ %.10s, from %s)",
-				EnvBinary, PinnedVersion, PinnedCommit, NightlyURL)
+				EnvBinary, PinnedVersion, PinnedCommit, ReleaseURL)
 		}
 		path = p
 	}

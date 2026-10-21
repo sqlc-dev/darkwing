@@ -49,7 +49,16 @@ func run(sql string, tokensOnly bool) error {
 	}
 	if tokensOnly {
 		for _, t := range tokens {
-			fmt.Printf("%-16s %4d..%-4d %q\n", t.Kind, t.Span.Start, t.Span.End, t.Text)
+			// trivia flags: n = preceded by a newline, c = preceded by a
+			// block comment (string literal continuation)
+			trivia := []byte("..")
+			if t.PrecededByNewline {
+				trivia[0] = 'n'
+			}
+			if t.PrecededByBlockComment {
+				trivia[1] = 'c'
+			}
+			fmt.Printf("%-16s %4d..%-4d %s %q\n", t.Kind, t.Span.Start, t.Span.End, trivia, t.Text)
 		}
 		return nil
 	}

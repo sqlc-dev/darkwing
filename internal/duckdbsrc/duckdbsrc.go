@@ -1,6 +1,6 @@
 // Package duckdbsrc locates and drives the pinned DuckDB CLI binary — the
-// conformance oracle. The pin is a source commit plus the nightly CLI build
-// of that commit; grammar, corpus expectations, and oracle must all come
+// conformance oracle. The pin is a tagged source commit plus the release
+// CLI built from it; grammar, corpus expectations, and oracle must all come
 // from the same commit (see internal/grammar/README.md).
 package duckdbsrc
 
@@ -58,7 +58,7 @@ func Verify(path string) error {
 	}
 	version := strings.TrimSpace(string(out))
 	if !strings.Contains(version, PinnedVersion) || !strings.Contains(version, PinnedCommit[:10]) {
-		return fmt.Errorf("binary %s reports %q, want %s @ %.10s: advance the pin or point %s at the matching nightly",
+		return fmt.Errorf("binary %s reports %q, want %s @ %.10s: advance the pin or point %s at the matching release CLI",
 			path, version, PinnedVersion, PinnedCommit, EnvBinary)
 	}
 	return nil

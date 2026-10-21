@@ -709,8 +709,8 @@ func (tc *transformContext) transformPivotValueList(n tnode, expandHeader bool) 
 // everything else stay expressions, folded by the binder.
 func (tc *transformContext) pivotEntry(n tnode) ast.PivotColumnEntry {
 	expr := tc.transformAliasedExpression(n)
+	// the expression keeps its alias (TransformPivotTargetList)
 	entry := ast.PivotColumnEntry{Alias: expr.GetAlias()}
-	expr.SetAlias("")
 	if values, ok := pivotInListValues(expr); ok && len(values) > 0 {
 		entry.Values = values
 	} else {

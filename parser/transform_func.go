@@ -84,7 +84,7 @@ func (tc *transformContext) transformFunction(n tnode) ast.Expr {
 		return tc.transformOver(over, qn, name, parts, filter, n.span())
 	}
 	// zero-argument count() is count_star(), for non-window calls only
-	if name == "count" && len(parts.args) == 0 && schema == "" && catalog == "" {
+	if name == "count" && len(parts.args) == 0 {
 		name = "count_star"
 	}
 	if out := parserFunctionRewrite(n.span(), name, parts.args, false); out != nil {

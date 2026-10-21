@@ -186,10 +186,16 @@ func (t *PivotRef) Children() []Node {
 type ShowType string
 
 const (
-	ShowTypeDescribe        ShowType = "DESCRIBE"
-	ShowTypeSummary         ShowType = "SUMMARY"
-	ShowTypeShowFrom        ShowType = "SHOW_FROM"
-	ShowTypeShowUnqualified ShowType = "SHOW_UNQUALIFIED"
+	ShowTypeDescribe ShowType = "DESCRIBE"
+	ShowTypeSummary  ShowType = "SUMMARY"
+	// ShowTypeShow is "SHOW name": a setting, falling back to describing
+	// a table (v2.0).
+	ShowTypeShow     ShowType = "SHOW"
+	ShowTypeShowFrom ShowType = "SHOW_FROM"
+	// ShowTypeShowSpecial is the MySQL-inherited special forms (SHOW
+	// TABLES/DATABASES/SCHEMAS/VARIABLES, SHOW ALL TABLES); v2.0 renamed
+	// SHOW_UNQUALIFIED.
+	ShowTypeShowSpecial ShowType = "SHOW_SPECIAL"
 )
 
 // ShowRef is the relation behind SHOW/DESCRIBE/SUMMARIZE. Port of
@@ -199,6 +205,9 @@ type ShowRef struct {
 	TableName   string `json:"table_name,omitempty"`
 	CatalogName string `json:"catalog_name,omitempty"`
 	SchemaName  string `json:"schema_name,omitempty"`
+	// Qualification is the full qualification path of a nested name
+	// (see BaseTableRef.Qualification).
+	Qualification []string `json:"qualification,omitempty"`
 	// Query is set when describing a query (`DESCRIBE SELECT ...`).
 	Query    QueryNode `json:"query,omitempty"`
 	ShowType ShowType  `json:"show_type"`

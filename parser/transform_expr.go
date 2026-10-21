@@ -527,80 +527,79 @@ func (tc *transformContext) transformInClause(input ast.Expr, n tnode) ast.Expr 
 	return nil
 }
 
-// likeFunc maps the like-variation rule (plus negation) to the function
-// upstream emits: (name, is_operator, wrapInNot).
-func likeFunc(variation string, negated bool) (string, bool, bool) {
-	switch variation {
-	case "LikeToken":
-		if negated {
-			return "!~~", true, false
-		}
-		return "~~", true, false
-	case "ILikeToken":
-		if negated {
-			return "!~~*", true, false
-		}
-		return "~~*", true, false
-	case "GlobToken":
-		return "~~~", true, negated
-	case "SimilarToToken":
-		return "regexp_full_match", false, negated
-	case "RegexMatchToken":
-		return "regexp_matches", false, negated
-	case "RegexInsensitiveMatchToken":
-		return "regexp_matches", false, negated // + 'i' flag argument
-	case "NotLikeOp":
-		return "!~~", true, negated
-	case "NotILikeOp":
-		return "!~~*", true, negated
-	case "NotRegexInsensitiveMatchOp":
-		return "regexp_matches", false, !negated // + 'i' flag
-	case "NotSimilarToOp":
-		// '!~' is the negated regex match operator
-		return "regexp_matches", false, !negated
-	}
-	return "", false, false
+// likeVariationNames maps the LikeVariations rules to the function name
+// upstream's transformers return for them (TransformLikeToken & co.,
+// with the default regexp_matches semantics).
+var likeVariationNames = map[string]string{
+	"LikeToken":                  "~~",
+	"ILikeToken":                 "~~*",
+	"GlobToken":                  "~~~",
+	"SimilarToToken":             "regexp_full_match",
+	"RegexMatchToken":            "regexp_matches",
+	"RegexInsensitiveMatchToken": "regexp_matches__case_insensitive",
+	"NotLikeOp":                  "!~~",
+	"NotILikeOp":                 "!~~*",
+	"NotRegexInsensitiveMatchOp": "!regexp_matches__case_insensitive",
+	"NotSimilarToOp":             "!regexp_matches",
 }
 
 // LikeClause <- LikeVariations OtherOperatorExpression EscapeClause?
-// The function's location is the like clause itself; a NOT wrapper covers
-// the whole expression (wholeSp).
+// Port of TransformLikeClause plus the function branch of
+// ApplyBetweenInLikeOperator: ESCAPE turns ~~/~~* into
+// like_escape/ilike_escape (other variations keep their name and take
+// the escape as a third argument); a negated regex spelling becomes NOT
+// around the positive function; NOT before ~~/~~* negates the operator
+// itself, any other NOT wraps the function. The function's location is
+// the like clause itself; a NOT wrapper takes wholeSp.
 func (tc *transformContext) transformLikeClause(input ast.Expr, n tnode, negated bool, wholeSp ast.Span) ast.Expr {
 	sp := n.span()
 	_, variation := n.child(0).sole().choice()
-	pattern := tc.transformOtherOperator(n.child(1))
-	name, isOp, wrapNot := likeFunc(variation.name(), negated)
-	if name == "" {
+	name, ok := likeVariationNames[variation.name()]
+	if !ok {
 		shapeError(variation, "unknown like variation")
 	}
+	pattern := tc.transformOtherOperator(n.child(1))
+	caseInsensitive := strings.HasSuffix(name, "__case_insensitive")
+	name = strings.TrimSuffix(name, "__case_insensitive")
+	bare := strings.TrimPrefix(name, "!")
+	isRegex := bare == "regexp_matches" || bare == "regexp_full_match"
 	args := []ast.Expr{input, pattern}
-	insensitiveRegex := variation.name() == "RegexInsensitiveMatchToken" || variation.name() == "NotRegexInsensitiveMatchOp"
-	if insensitiveRegex {
-		args = append(args, constExpr(invalidSpan, varcharValue("i")))
-	}
 	if escNode, ok := n.child(2).opt(); ok {
-		// EscapeClause <- 'ESCAPE' ComparisonExpression; negation stays a
-		// NOT wrapper around the positive escape function
-		esc := tc.transformComparison(escNode.child(1))
+		// EscapeClause <- 'ESCAPE' OtherOperatorExpression
+		esc := tc.transformOtherOperator(escNode.child(1))
+		if caseInsensitive {
+			raise("ESCAPE clause is not supported with case-insensitive regular expression match operators")
+		}
 		switch name {
 		case "~~":
-			name, isOp = "like_escape", true
-		case "!~~":
-			name, isOp, wrapNot = "like_escape", true, !wrapNot
+			name = "like_escape"
 		case "~~*":
-			name, isOp = "ilike_escape", true
-		case "!~~*":
-			name, isOp, wrapNot = "ilike_escape", true, !wrapNot
-		default:
-			raise("ESCAPE is only supported for LIKE/ILIKE")
+			name = "ilike_escape"
 		}
 		args = append(args, esc)
 	}
+	if caseInsensitive {
+		args = append(args, stringConst(invalidSpan, "i"))
+	}
+	// TryRemoveRegexOperatorNegation / TryNegateLikeFunction
+	regexNegated := isRegex && strings.HasPrefix(name, "!")
+	if regexNegated {
+		name = bare
+	}
+	wrapNot := regexNegated != negated
+	if negated && !regexNegated {
+		switch name {
+		case "~~":
+			name, wrapNot = "!~~", false
+		case "~~*":
+			name, wrapNot = "!~~*", false
+		}
+	}
 	var result ast.Expr
-	if isOp {
-		result = opCall(sp, name, args...)
-	} else {
+	if isRegex {
 		result = fnCall(sp, name, args...)
+	} else {
+		result = opCall(sp, name, args...)
 	}
 	if wrapNot {
 		result = notExpr(wholeSp, result)

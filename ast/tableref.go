@@ -182,10 +182,15 @@ func (t *PivotRef) Children() []Node {
 type ShowType string
 
 const (
-	ShowTypeDescribe        ShowType = "DESCRIBE"
-	ShowTypeSummary         ShowType = "SUMMARY"
-	ShowTypeShowFrom        ShowType = "SHOW_FROM"
-	ShowTypeShowUnqualified ShowType = "SHOW_UNQUALIFIED"
+	ShowTypeDescribe ShowType = "DESCRIBE"
+	ShowTypeSummary  ShowType = "SUMMARY"
+	// ShowTypeShow is `SHOW name`: a setting, falling back to describing
+	// a table of that name.
+	ShowTypeShow     ShowType = "SHOW"
+	ShowTypeShowFrom ShowType = "SHOW_FROM"
+	// ShowTypeShowSpecial is SHOW TABLES / DATABASES / SCHEMAS /
+	// VARIABLES and SHOW ALL TABLES.
+	ShowTypeShowSpecial ShowType = "SHOW_SPECIAL"
 )
 
 // ShowRef is the relation behind SHOW/DESCRIBE/SUMMARIZE. Port of

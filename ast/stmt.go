@@ -78,6 +78,9 @@ type InsertStatement struct {
 	// Columns is the explicit insert column list.
 	Columns     []string          `json:"columns,omitempty"`
 	ColumnOrder InsertColumnOrder `json:"column_order,omitempty"`
+	// Overriding is the OVERRIDING {USER|SYSTEM} VALUE scope (parsed and
+	// otherwise ignored upstream).
+	Overriding string `json:"overriding,omitempty"`
 	// Query is the inserted data; nil for DEFAULT VALUES.
 	Query         *SelectStatement `json:"select_statement,omitempty"`
 	DefaultValues bool             `json:"default_values,omitempty"`
@@ -170,7 +173,10 @@ func (s *DeleteStatement) Children() []Node {
 // statement but represented like upstream as a delete without a WHERE.
 type TruncateStatement struct {
 	stmtBase
-	Table       TableRef     `json:"table"`
+	Table TableRef `json:"table"`
+	// Cascade records TRUNCATE ... CASCADE (rejected upstream as not
+	// implemented, after parsing).
+	Cascade     bool         `json:"cascade,omitempty"`
 	NamedParams []NamedParam `json:"named_param_map,omitempty"`
 }
 

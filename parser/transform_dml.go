@@ -5,6 +5,8 @@
 package parser
 
 import (
+	"strings"
+
 	"github.com/sqlc-dev/darkwing/ast"
 )
 
@@ -36,8 +38,8 @@ func (tc *transformContext) transformReturning(n tnode) []ast.Expr {
 }
 
 // InsertStatement <- WithClause? 'INSERT' OrAction? 'INTO' InsertTarget
-// ByNameOrPosition? InsertColumnList? InsertValues OnConflictClause?
-// ReturningClause?
+// ByNameOrPosition? InsertColumnList? OverridingClause? InsertValues
+// OnConflictClause? ReturningClause?
 func (tc *transformContext) transformInsert(n tnode) ast.Stmt {
 	stmt := &ast.InsertStatement{}
 	stmt.SetSpan(n.span())
@@ -68,27 +70,39 @@ func (tc *transformContext) transformInsert(n tnode) ast.Stmt {
 	if cols, ok := n.child(6).opt(); ok {
 		stmt.Columns = identifierList(cols.sole().parens())
 	}
+	if ov, ok := n.child(7).opt(); ok {
+		// OverridingClause <- 'OVERRIDING' OverridingScope 'VALUE'
+		stmt.Overriding = strings.ToUpper(identifierText(ov.child(1)))
+	}
 	// InsertValues <- SelectInsertValues / DefaultValues
-	_, values := n.child(7).sole().choice()
+	_, values := n.child(8).sole().choice()
+	var onConflict *ast.OnConflictInfo
 	switch values.name() {
 	case "SelectInsertValues":
 		stmt.Query = tc.transformSelectInternalStatement(values.sole())
 	case "DefaultValues":
-		if len(stmt.Columns) > 0 {
-			raise("You can not provide both a column list and DEFAULT VALUES, please remove one of the two")
-		}
 		stmt.DefaultValues = true
 	default:
 		shapeError(values, "unknown insert values")
 	}
-	if oc, ok := n.child(8).opt(); ok {
+	if oc, ok := n.child(9).opt(); ok {
+		onConflict = tc.transformOnConflict(oc)
+	}
+	if ret, ok := n.child(10).opt(); ok {
+		stmt.Returning = tc.transformReturning(ret)
+	}
+	// TransformInsertStatement's checks run after its children transform
+	if stmt.DefaultValues && len(stmt.Columns) > 0 {
+		raise("You can not provide both a column list and DEFAULT VALUES, please remove one of the two")
+	}
+	if stmt.DefaultValues && stmt.Overriding != "" {
+		raise("OVERRIDING SYSTEM|USER VALUE can not be combined with DEFAULT VALUES, please remove one of the two")
+	}
+	if onConflict != nil {
 		if stmt.OnConflict != nil {
 			raise("You can not provide both OR REPLACE|IGNORE and an ON CONFLICT clause, please remove the first if you want to have more granular control")
 		}
-		stmt.OnConflict = tc.transformOnConflict(oc)
-	}
-	if ret, ok := n.child(9).opt(); ok {
-		stmt.Returning = tc.transformReturning(ret)
+		stmt.OnConflict = onConflict
 	}
 	return stmt
 }
@@ -126,7 +140,7 @@ func (tc *transformContext) transformOnConflict(n tnode) *ast.OnConflictInfo {
 	_, action := n.child(3).sole().choice()
 	switch action.name() {
 	case "OnConflictUpdate":
-		// 'DO' 'UPDATE' 'SET' UpdateSetClause WhereClause?
+		// 'DO' 'UPDATE' 'SET' UpdateSetClauseList WhereClause?
 		info.Action = ast.OnConflictUpdate
 		set := tc.transformUpdateSetClause(action.child(3))
 		if wc, ok := action.child(4).opt(); ok {
@@ -141,48 +155,56 @@ func (tc *transformContext) transformOnConflict(n tnode) *ast.OnConflictInfo {
 	return info
 }
 
-// UpdateSetClause <- UpdateSetElementList / UpdateSetTuple
+// UpdateSetClauseList <- List(UpdateSetClause): the clauses' columns and
+// expressions concatenate (TransformUpdateSetClauseList).
 func (tc *transformContext) transformUpdateSetClause(n tnode) *ast.UpdateSetInfo {
 	set := &ast.UpdateSetInfo{}
 	set.SetSpan(n.span())
+	for _, clause := range n.sole().listElems() {
+		tc.appendUpdateSetClause(set, clause)
+	}
+	return set
+}
+
+// UpdateSetClause <- UpdateSetElement / UpdateSetTuple
+func (tc *transformContext) appendUpdateSetClause(set *ast.UpdateSetInfo, n tnode) {
 	_, alt := n.sole().choice()
 	switch alt.name() {
-	case "UpdateSetElementList":
-		for _, e := range alt.sole().listElems() {
-			// UpdateSetElement <- UpdateSetColumnTarget '=' Expression
-			target := updateSetColumnTarget(e.child(0))
-			if len(target) > 1 {
-				raise("Qualified column names in UPDATE .. SET not supported")
-			}
-			set.Columns = append(set.Columns, target)
-			set.Expressions = append(set.Expressions, tc.transformExpression(e.child(2)))
+	case "UpdateSetElement":
+		// UpdateSetElement <- UpdateSetColumnTarget '=' Expression
+		target := updateSetColumnTarget(alt.child(0))
+		if len(target) > 1 {
+			raise("Qualified column names in UPDATE .. SET not supported")
 		}
+		set.Columns = append(set.Columns, target)
+		set.Expressions = append(set.Expressions, tc.transformExpression(alt.child(2)))
 	case "UpdateSetTuple":
 		// Parens(List(ColumnName)) '=' Expression: a row-valued
 		// expression is unpacked onto the columns (with a count check);
 		// any other expression assigns to every column, like upstream
+		var columns [][]string
 		for _, c := range alt.child(0).parens().listElems() {
-			set.Columns = append(set.Columns, []string{identifierText(c)})
+			columns = append(columns, []string{identifierText(c)})
 		}
+		set.Columns = append(set.Columns, columns...)
 		expr := tc.transformExpression(alt.child(2))
 		if fn, isFn := expr.(*ast.FunctionExpression); isFn && fn.FunctionName == "row" &&
 			fn.Schema == "" && fn.Catalog == "" {
-			if len(fn.Arguments) != len(set.Columns) {
+			if len(fn.Arguments) != len(columns) {
 				raise("Could not perform assignment, expected %d values, got %d",
-					len(set.Columns), len(fn.Arguments))
+					len(columns), len(fn.Arguments))
 			}
 			for _, a := range fn.Arguments {
 				set.Expressions = append(set.Expressions, a.Expr)
 			}
 		} else {
-			for range set.Columns {
+			for range columns {
 				set.Expressions = append(set.Expressions, expr)
 			}
 		}
 	default:
 		shapeError(alt, "unknown update set clause")
 	}
-	return set
 }
 
 // updateSetColumnTarget flattens ColumnName DotIdentifier* into a dotted
@@ -195,7 +217,7 @@ func updateSetColumnTarget(n tnode) []string {
 	return path
 }
 
-// UpdateStatement <- WithClause? 'UPDATE' UpdateTarget UpdateSetClause
+// UpdateStatement <- WithClause? 'UPDATE' UpdateTarget UpdateSetClauseList
 // FromClause? WhereClause? ReturningClause?
 func (tc *transformContext) transformUpdate(n tnode) ast.Stmt {
 	stmt := &ast.UpdateStatement{}
@@ -230,15 +252,20 @@ func (tc *transformContext) transformUpdate(n tnode) ast.Stmt {
 	return stmt
 }
 
-// transformTargetOptAlias maps TargetOptAlias (BaseTableName 'AS'? ColId?).
+// transformTargetOptAlias maps TargetOptAlias (BaseTableName TargetAlias?).
 func (tc *transformContext) transformTargetOptAlias(n tnode) *ast.BaseTableRef {
 	ref := &ast.BaseTableRef{}
 	ref.SetSpan(n.span())
 	tc.fillBaseTableName(ref, n.child(0))
-	if alias, ok := n.child(2).opt(); ok {
-		ref.Alias = identifierText(alias)
+	if alias, ok := n.child(1).opt(); ok {
+		ref.Alias = targetAlias(alias)
 	}
 	return ref
+}
+
+// targetAlias maps TargetAlias <- 'AS'? ColId.
+func targetAlias(n tnode) string {
+	return identifierText(n.child(1))
 }
 
 // DeleteStatement <- WithClause? 'DELETE' 'FROM' TargetOptAlias
@@ -268,7 +295,11 @@ func (tc *transformContext) transformDelete(n tnode) ast.Stmt {
 	return stmt
 }
 
-// TruncateStatement <- 'TRUNCATE' 'TABLE'? BaseTableName
+// TruncateStatement <- 'TRUNCATE' 'TABLE'? BaseTableName TruncateOptions?
+// TruncateOptions <- TruncateDropBehavior / TruncateAliasOptions
+// TruncateAliasOptions <- TargetAlias TruncateDropBehavior?
+// The alias is ignored; CASCADE raises NotImplemented upstream
+// (post-parse), so darkwing records it.
 func (tc *transformContext) transformTruncate(n tnode) ast.Stmt {
 	stmt := &ast.TruncateStatement{}
 	stmt.SetSpan(n.span())
@@ -277,6 +308,20 @@ func (tc *transformContext) transformTruncate(n tnode) ast.Stmt {
 	ref.SetSpan(invalidSpan)
 	tc.fillBaseTableName(ref, n.child(2))
 	stmt.Table = ref
+	if opts, ok := n.child(3).opt(); ok {
+		_, alt := opts.sole().choice()
+		var behavior tnode
+		hasBehavior := false
+		if alt.name() == "TruncateDropBehavior" {
+			behavior, hasBehavior = alt, true
+		} else {
+			behavior, hasBehavior = alt.child(1).opt()
+		}
+		if hasBehavior {
+			_, b := behavior.sole().sole().choice()
+			stmt.Cascade = b.name() == "CascadeDropBehavior"
+		}
+	}
 	return stmt
 }
 
@@ -380,7 +425,7 @@ func (tc *transformContext) fillMergeAction(action *ast.MergeIntoAction, n tnode
 			case "UpdateMatchSetAction":
 				// UpdateMatchSetClause <- 'SET' UpdateMatchSetInfo
 				_, setInfo := kind.sole().child(1).sole().choice()
-				if setInfo.name() == "UpdateSetClause" {
+				if setInfo.name() == "UpdateSetClauseList" {
 					action.SetInfo = tc.transformUpdateSetClause(setInfo)
 				}
 				// SET * keeps a nil SetInfo (update everything)

@@ -206,14 +206,18 @@ func (tc *transformContext) transformBaseTableRef(n tnode) ast.TableRef {
 }
 
 // fillBaseTableName fills catalog/schema/table from a BaseTableName node.
-// BaseTableName <- CatalogReservedSchemaTable / SchemaReservedTable /
-// UnqualifiedBaseTableName
+// BaseTableName <- QualifiedTableName / UnqualifiedBaseTableName
+// QualifiedTableName <- CatalogReservedSchemaTable / SchemaReservedTable
 func (tc *transformContext) fillBaseTableName(ref *ast.BaseTableRef, n tnode) {
 	_, alt := n.sole().choice()
+	if alt.name() == "QualifiedTableName" {
+		_, alt = alt.sole().choice()
+	}
 	switch alt.name() {
 	case "CatalogReservedSchemaTable":
+		// CatalogQualification ReservedSchemaQualification+ ReservedTableName
 		ref.CatalogName = identifierText(alt.child(0).child(0))
-		ref.SchemaName = identifierText(alt.child(1).child(0))
+		ref.SchemaName = lastSchemaQualification(alt.child(1))
 		ref.TableName = identifierText(alt.child(2))
 	case "SchemaReservedTable":
 		ref.SchemaName = identifierText(alt.child(0).child(0))
@@ -225,6 +229,15 @@ func (tc *transformContext) fillBaseTableName(ref *ast.BaseTableRef, n tnode) {
 	}
 }
 
+// lastSchemaQualification reads a ReservedSchemaQualification+ repetition.
+// Upstream (v2.0) keeps the whole nested schema path in its QualifiedName,
+// whose Schema() is the component directly before the name; darkwing's
+// three-part names keep that last component.
+func lastSchemaQualification(n tnode) string {
+	items := n.repeat()
+	return identifierText(items[len(items)-1].child(0))
+}
+
 // transformQualifiedNameParts splits a QualifiedName rule node.
 // QualifiedName <- CatalogReservedSchemaIdentifier /
 // SchemaReservedIdentifierOrStringLiteral / IdentifierOrStringLiteral
@@ -232,8 +245,10 @@ func (tc *transformContext) transformQualifiedNameParts(n tnode) (catalog, schem
 	_, alt := n.sole().choice()
 	switch alt.name() {
 	case "CatalogReservedSchemaIdentifier":
+		// CatalogQualification ReservedSchemaQualification+
+		// ReservedIdentifierOrStringLiteral
 		catalog = identifierText(alt.child(0).child(0))
-		schema = identifierText(alt.child(1).child(0))
+		schema = lastSchemaQualification(alt.child(1))
 		name = identifierText(alt.child(2))
 	case "SchemaReservedIdentifierOrStringLiteral":
 		schema = identifierText(alt.child(0).child(0))

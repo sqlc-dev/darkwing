@@ -6,7 +6,6 @@ package parser
 
 import (
 	"errors"
-	"fmt"
 	"math"
 	"strconv"
 	"strings"
@@ -111,14 +110,12 @@ func (tc *transformContext) transformSingle(n tnode) ast.Expr {
 	case "StructExpression":
 		return tc.transformStruct(alt)
 	case "PositionalExpression":
-		idx, err := strconv.ParseUint(alt.child(1).number(), 10, 64)
-		if err != nil {
-			raise("invalid positional reference")
-		}
-		if idx == 0 {
+		// TransformPositionalExpression: an INTEGER literal fitting int64
+		idx, ok := literalInt64(numberLiteral(alt.child(1).number()))
+		if !ok || idx <= 0 {
 			raise("Positional reference node needs to be >= 1")
 		}
-		p := &ast.PositionalReferenceExpression{Index: idx}
+		p := &ast.PositionalReferenceExpression{Index: uint64(idx)}
 		p.SetSpan(alt.span())
 		return p
 	case "DefaultExpression":
@@ -166,23 +163,31 @@ func (tc *transformContext) transformLiteral(n tnode) ast.Expr {
 }
 
 // stringConstant builds the constant for a string literal, honoring the
-// prefix kind.
+// prefix kind (StringLiteralParseResult::ToExpression).
 func (tc *transformContext) stringConstant(sp ast.Span, s string, kind matcher.StringKind) ast.Expr {
 	switch kind {
 	case matcher.StringHexadecimal:
-		// X'FF' -> BLOB \xFF
-		blob, ok := hexToBlob(s)
-		if !ok {
-			raise("invalid hexadecimal string literal")
+		// X'FF' -> HEX literal "FF" (Literal::Hex validates the digits)
+		if len(s)%2 != 0 {
+			raise("Hex string literal must have an even number of hex digits")
 		}
-		return constExpr(sp, ast.Value{Type: ast.LogicalType{ID: "BLOB"}, Kind: ast.ValueString, Str: blob})
+		for i := 0; i < len(s); i++ {
+			if !isHexDigit(s[i]) {
+				raise("Hex string literal contains a non-hexadecimal character '%c'", s[i])
+			}
+		}
+		return literalExpr(sp, ast.Literal{Kind: ast.LiteralHex, Text: s})
 	case matcher.StringBit:
-		// B'1010' stays a VARCHAR "b1010" at parse time (the binder
-		// converts it)
-		return constExpr(sp, varcharValue("b"+s))
+		// B'1010' -> BIT literal "1010" (Literal::Bit validates the digits)
+		for i := 0; i < len(s); i++ {
+			if s[i] != '0' && s[i] != '1' {
+				raise("Bit string literal contains a non-binary character '%c'", s[i])
+			}
+		}
+		return literalExpr(sp, ast.Literal{Kind: ast.LiteralBit, Text: s})
 	case matcher.StringNational:
 		// N'abc' -> CAST('abc' AS VARCHAR)
-		child := constExpr(invalidSpan, varcharValue(s))
+		child := stringConst(invalidSpan, s)
 		cast := &ast.CastExpression{Child: child, ResolvedType: "VARCHAR"}
 		cast.SetSpan(sp)
 		return cast
@@ -292,51 +297,65 @@ func integerTypeFor(v int64) string {
 	return "BIGINT"
 }
 
-// numberConstant ports upstream's TransformNumberLiteral: integers become
-// INTEGER/BIGINT/HUGEINT (then DOUBLE), plain decimals become DECIMAL
-// with derived width/scale (up to width 38), exponent forms become
-// DOUBLE.
-// unconvertibleNumber stands in for a number literal whose text has no
-// value (e.g. "2.03.0", tokenized as a single number): upstream accepts
-// the token and throws InvalidInputException while constructing the
-// value ("Could not convert string ... to DECIMAL(5,1)") — post-parse
-// under the oracle's classification — so darkwing records the raw text
-// as a cast to the derived type and accepts (found by cmd/difftest).
-func unconvertibleNumber(sp ast.Span, text, typeID string) ast.Expr {
-	child := constExpr(invalidSpan, varcharValue(text))
-	cast := &ast.CastExpression{Child: child, ResolvedType: typeID}
-	cast.SetSpan(sp)
-	return cast
+// numberConstant ports upstream's TransformNumberLiteral, which since
+// v2.0 is ConstantExpression::Number: the literal keeps the number text
+// as written, classified INTEGER or NUMERIC (Literal::Number); the value
+// is only derived (by the binder upstream, for convenience here).
+func numberConstant(sp ast.Span, text string) *ast.ConstantExpression {
+	return literalExpr(sp, numberLiteral(text))
 }
 
-func numberConstant(sp ast.Span, text string) ast.Expr {
+// numberLiteral ports Literal::Number: text with a '.' or an exponent is
+// NUMERIC, anything else INTEGER.
+func numberLiteral(text string) ast.Literal {
+	if strings.ContainsAny(text, ".eE") {
+		return ast.Literal{Kind: ast.LiteralNumeric, Text: text}
+	}
+	return ast.Literal{Kind: ast.LiteralInteger, Text: text}
+}
+
+// numberValue ports NumberToValue (literal.cpp): integers become
+// INTEGER/BIGINT/HUGEINT/UHUGEINT (then DOUBLE), plain decimals become
+// DECIMAL with derived width/scale (up to width 38), exponent forms
+// become DOUBLE. ok is false for text with no value (e.g. "2.03.0", a
+// single number token), which upstream only rejects when binding.
+func numberValue(text string) (ast.Value, bool) {
 	clean := strings.ReplaceAll(text, "_", "")
 	lower := strings.ToLower(clean)
-	if strings.ContainsAny(lower, "e") {
+	double := func() (ast.Value, bool) {
 		f, err := parseDouble(clean)
 		if err != nil {
-			return unconvertibleNumber(sp, clean, "DOUBLE")
+			return ast.Value{}, false
 		}
-		return constExpr(sp, ast.Value{Type: ast.LogicalType{ID: "DOUBLE"}, Kind: ast.ValueDouble, Float64: f})
+		return ast.Value{Type: ast.LogicalType{ID: "DOUBLE"}, Kind: ast.ValueDouble, Float64: f}, true
+	}
+	if strings.ContainsAny(lower, "e") {
+		return double()
 	}
 	if dot := strings.IndexByte(clean, '.'); dot >= 0 {
-		return decimalConstant(sp, clean, dot)
+		return decimalValue(clean, dot)
 	}
 	// integer path
 	if v, err := strconv.ParseInt(clean, 10, 64); err == nil {
-		return constExpr(sp, ast.Value{Type: ast.LogicalType{ID: integerTypeFor(v)}, Kind: ast.ValueInt64, Int64: v})
+		return ast.Value{Type: ast.LogicalType{ID: integerTypeFor(v)}, Kind: ast.ValueInt64, Int64: v}, true
 	}
 	if h, ok := parseHugeint(clean); ok {
-		return constExpr(sp, ast.Value{Type: ast.LogicalType{ID: "HUGEINT"}, Kind: ast.ValueHugeint, Hugeint: h})
+		return ast.Value{Type: ast.LogicalType{ID: "HUGEINT"}, Kind: ast.ValueHugeint, Hugeint: h}, true
 	}
 	if h, ok := parseUint128(clean); ok {
-		return constExpr(sp, ast.Value{Type: ast.LogicalType{ID: "UHUGEINT"}, Kind: ast.ValueHugeint, Hugeint: h})
+		return ast.Value{Type: ast.LogicalType{ID: "UHUGEINT"}, Kind: ast.ValueHugeint, Hugeint: h}, true
 	}
-	f, err := parseDouble(clean)
-	if err != nil {
-		return unconvertibleNumber(sp, clean, "DOUBLE")
+	return double()
+}
+
+// literalInt64 ports Literal::TryGetInt64: only INTEGER literals that fit
+// an int64 qualify.
+func literalInt64(l ast.Literal) (int64, bool) {
+	if l.Kind != ast.LiteralInteger {
+		return 0, false
 	}
-	return constExpr(sp, ast.Value{Type: ast.LogicalType{ID: "DOUBLE"}, Kind: ast.ValueDouble, Float64: f})
+	v, err := strconv.ParseInt(strings.ReplaceAll(l.Text, "_", ""), 10, 64)
+	return v, err == nil
 }
 
 // parseDouble parses a float literal the way upstream does: values whose
@@ -353,7 +372,7 @@ func parseDouble(s string) (float64, error) {
 // digits: width counts the integer digits as written (leading zeros
 // included) plus the scale; literals too wide for DECIMAL(38) fall back
 // to DOUBLE.
-func decimalConstant(sp ast.Span, clean string, dot int) ast.Expr {
+func decimalValue(clean string, dot int) (ast.Value, bool) {
 	intPart := strings.TrimLeft(clean[:dot], "+-")
 	fracPart := clean[dot+1:]
 	digits := strings.TrimLeft(intPart, "0")
@@ -365,23 +384,26 @@ func decimalConstant(sp ast.Span, clean string, dot int) ast.Expr {
 	if width > 38 {
 		f, err := parseDouble(clean)
 		if err != nil {
-			return unconvertibleNumber(sp, clean, "DOUBLE")
+			return ast.Value{}, false
 		}
-		return constExpr(sp, ast.Value{Type: ast.LogicalType{ID: "DOUBLE"}, Kind: ast.ValueDouble, Float64: f})
+		return ast.Value{Type: ast.LogicalType{ID: "DOUBLE"}, Kind: ast.ValueDouble, Float64: f}, true
 	}
 	unscaled := digits + fracPart
 	if unscaled == "" {
 		unscaled = "0"
 	}
+	if strings.HasPrefix(clean, "-") {
+		unscaled = "-" + unscaled
+	}
 	typ := ast.LogicalType{ID: "DECIMAL", Width: width, Scale: scale}
 	if v, err := strconv.ParseInt(unscaled, 10, 64); err == nil && width <= 18 {
-		return constExpr(sp, ast.Value{Type: typ, Kind: ast.ValueInt64, Int64: v})
+		return ast.Value{Type: typ, Kind: ast.ValueInt64, Int64: v}, true
 	}
 	h, ok := parseHugeint(unscaled)
 	if !ok {
-		return unconvertibleNumber(sp, clean, fmt.Sprintf("DECIMAL(%d,%d)", width, scale))
+		return ast.Value{}, false
 	}
-	return constExpr(sp, ast.Value{Type: typ, Kind: ast.ValueHugeint, Hugeint: h})
+	return ast.Value{Type: typ, Kind: ast.ValueHugeint, Hugeint: h}, true
 }
 
 // parseHugeint parses a decimal digit string into a 128-bit integer.
@@ -495,12 +517,14 @@ func (tc *transformContext) transformParameter(n tnode) ast.Expr {
 	return p
 }
 
+// atoiOrRaise reads a ?N / $N parameter number: upstream requires an
+// INTEGER literal fitting int64 that is greater than 0.
 func atoiOrRaise(s string) int {
-	v, err := strconv.Atoi(s)
-	if err != nil {
-		raise("invalid parameter number \"%s\"", s)
+	v, ok := literalInt64(numberLiteral(s))
+	if !ok || v <= 0 {
+		raise("Parameter numbers must be greater than 0")
 	}
-	return v
+	return int(v)
 }
 
 // ---- subqueries, case, star -------------------------------------------
@@ -702,6 +726,18 @@ func (tc *transformContext) transformColumnReference(n tnode) ast.Expr {
 	_, alt := n.sole().choice()
 	var names []string
 	switch alt.name() {
+	case "NestedSchemaTableColumnName":
+		// CatalogQualification ReservedSchemaQualification
+		// ReservedSchemaQualification ReservedSchemaQualification+
+		// ReservedColumnName: five or more components, all kept as the
+		// column reference's path
+		for i := 0; i < 3; i++ {
+			names = append(names, identifierText(alt.child(i).child(0)))
+		}
+		for _, q := range alt.child(3).repeat() {
+			names = append(names, identifierText(q.child(0)))
+		}
+		names = append(names, identifierText(alt.child(4)))
 	case "CatalogReservedSchemaTableColumnName":
 		names = qualificationChain(alt, 4)
 	case "SchemaReservedTableColumnName":

@@ -14,7 +14,6 @@ import (
 // typeCastFunctions maps type-named single-argument calls to the
 // resolved logical type they cast to.
 var typeCastFunctions = map[string]string{
-	"date":      "DATE",
 	"time":      "TIME",
 	"timestamp": "TIMESTAMP",
 	"interval":  "INTERVAL",
@@ -52,18 +51,58 @@ type functionParts struct {
 // FunctionExpression <- FunctionIdentifier FunctionExpressionArguments
 // WithinGroupClause? FilterClause? ExportClause? OverClause?
 func (tc *transformContext) transformFunction(n tnode) ast.Expr {
-	catalog, schema, name := tc.transformFunctionIdentifier(n.child(0))
+	qn, rawName := tc.transformFunctionIdentifier(n.child(0))
+	catalog, schema, name := qn.catalog, qn.schema, strings.ToLower(rawName)
 	parts := tc.transformFunctionArgumentList(n.child(1).sole().parens())
-	starCallRewrite(&parts)
-	if wg, ok := n.child(2).opt(); ok {
-		// WITHIN GROUP (ORDER BY ...): the ordering replaces the
-		// function's ORDER BY, and only the ordered-set aggregates are
-		// accepted (renamed to their quantile implementations)
-		orderBy := wg.child(2).parens()
-		parts.orderBys = tc.transformOrderByClause(orderBy)
+	wg, hasWithinGroup := n.child(2).opt()
+	if hasWithinGroup {
+		// WITHIN GROUP (ORDER BY ...) replaces the function's ORDER BY
+		if parts.distinct {
+			raise("DISTINCT is not allowed in combination with WITHIN GROUP")
+		}
+		if len(parts.orderBys) > 0 {
+			raise("Cannot use multiple ORDER BY statements with WITHIN GROUP")
+		}
+		parts.orderBys = tc.transformOrderByClause(wg.child(2).parens())
 		if len(parts.orderBys) != 1 {
 			raise("Cannot use multiple ORDER BY clauses with WITHIN GROUP")
 		}
+	}
+	starCallRewrite(&parts)
+	var filter ast.Expr
+	if fc, ok := n.child(3).opt(); ok {
+		// FilterClause <- 'FILTER' Parens('WHERE'? Expression)
+		contents := fc.child(1).sole().parens()
+		filter = tc.transformExpression(contents.child(1))
+	}
+	_, exportState := n.child(4).opt()
+
+	if over, ok := n.child(5).opt(); ok {
+		if exportState {
+			raise("EXPORT_STATE is not supported for window functions!")
+		}
+		return tc.transformOver(over, qn, name, parts, filter, n.span())
+	}
+	// zero-argument count() is count_star(), for non-window calls only
+	if name == "count" && len(parts.args) == 0 && schema == "" && catalog == "" {
+		name = "count_star"
+	}
+	if out := parserFunctionRewrite(n.span(), name, parts.args, false); out != nil {
+		return out
+	}
+	// single-argument calls named after a type are casts (TIME('...'))
+	if id, isType := typeCastFunctions[name]; isType && schema == "" && catalog == "" &&
+		len(parts.args) == 1 && parts.args[0].Name == "" && !parts.distinct && filter == nil {
+		cast := &ast.CastExpression{Child: parts.args[0].Expr, ResolvedType: id}
+		cast.SetSpan(n.span())
+		return cast
+	}
+	if parts.hasNullsOpt {
+		raise("RESPECT/IGNORE NULLS is not supported for non-window functions")
+	}
+	if hasWithinGroup {
+		// only the ordered-set aggregates are accepted (renamed to their
+		// quantile implementations)
 		switch name {
 		case "percentile_cont":
 			if len(parts.args) != 1 {
@@ -80,98 +119,138 @@ func (tc *transformContext) transformFunction(n tnode) ast.Expr {
 				raise("Wrong number of arguments for MODE")
 			}
 		default:
-			raise("Unknown ordered aggregate \"%s\".", name)
+			raise("Unknown ordered aggregate %s.", quoteIdent(rawName))
 		}
-	}
-	var filter ast.Expr
-	if fc, ok := n.child(3).opt(); ok {
-		// FilterClause <- 'FILTER' Parens('WHERE'? Expression)
-		contents := fc.child(1).sole().parens()
-		filter = tc.transformExpression(contents.child(1))
-	}
-	_, exportState := n.child(4).opt()
-
-	if over, ok := n.child(5).opt(); ok {
-		if exportState {
-			raise("EXPORT_STATE is not supported for window functions!")
-		}
-		return tc.transformOver(over, catalog, schema, name, parts, filter, n.span())
-	}
-	if parts.hasNullsOpt {
-		raise("RESPECT/IGNORE NULLS is not supported for non-window functions")
-	}
-	// zero-argument count() is count_star(), for non-window calls only
-	if name == "count" && len(parts.args) == 0 && schema == "" && catalog == "" {
-		name = "count_star"
-	}
-	// single-argument calls named after a type are casts (DATE('...'))
-	if id, isType := typeCastFunctions[name]; isType && schema == "" && catalog == "" &&
-		len(parts.args) == 1 && parts.args[0].Name == "" && !parts.distinct && filter == nil {
-		cast := &ast.CastExpression{Child: parts.args[0].Expr, ResolvedType: id}
-		cast.SetSpan(n.span())
-		return cast
-	}
-	if (name == "if" || name == "ifnull") && schema == "" && catalog == "" &&
-		!parts.distinct && filter == nil && len(parts.orderBys) == 0 {
-		if name == "if" && len(parts.args) == 3 {
-			c := &ast.CaseExpression{
-				CaseChecks: []ast.CaseCheck{{When: parts.args[0].Expr, Then: parts.args[1].Expr}},
-				ElseExpr:   parts.args[2].Expr,
-			}
-			c.SetSpan(n.span())
-			return c
-		}
-		if name == "ifnull" && len(parts.args) == 2 {
-			return opExpr(n.span(), ast.OperatorCoalesce, parts.args[0].Expr, parts.args[1].Expr)
-		}
-	}
-	if name == "construct_array" && schema == "" && catalog == "" && !parts.distinct && filter == nil {
-		// construct_array(...) is the ARRAY[...] operator
-		var children []ast.Expr
-		for _, a := range parts.args {
-			children = append(children, a.Expr)
-		}
-		return opExpr(n.span(), ast.ArrayConstructor, children...)
 	}
 	f := &ast.FunctionExpression{
-		Catalog:      catalog,
-		Schema:       schema,
-		FunctionName: name,
-		Arguments:    parts.args,
-		Distinct:     parts.distinct,
-		ExportState:  exportState,
-		Filter:       filter,
-		OrderBys:     parts.orderBys,
+		Catalog:       catalog,
+		Schema:        schema,
+		Qualification: qn.path,
+		FunctionName:  name,
+		Arguments:     parts.args,
+		Distinct:      parts.distinct,
+		ExportState:   exportState,
+		Filter:        filter,
+		OrderBys:      parts.orderBys,
 	}
 	f.SetSpan(n.span())
 	return f
 }
 
+// quoteIdent renders an identifier the way upstream formats an Identifier
+// into an exception message (SQLQuotedIdentifier: always double-quoted,
+// embedded quotes doubled).
+func quoteIdent(s string) string {
+	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+}
+
+// parserFunctionRewrite ports TransformParserFunctionRewrite: the names
+// the parser turns into a syntax node instead of a catalog function call.
+// Both the plain call and the method chain (x.f(y)) go through it;
+// COALESCE has a grammar rule of its own, so only the method chain
+// rewrites it. It returns nil for an ordinary function.
+func parserFunctionRewrite(sp ast.Span, name string, args []ast.FunctionArgument, methodChain bool) ast.Expr {
+	rejectNamed := func(context string) {
+		for _, a := range args {
+			if a.Name != "" {
+				raise("Named arguments are not supported in %s", context)
+			}
+		}
+	}
+	children := func() []ast.Expr {
+		out := make([]ast.Expr, len(args))
+		for i, a := range args {
+			out[i] = a.Expr
+		}
+		return out
+	}
+	switch name {
+	case "unpack":
+		if len(args) != 1 {
+			raise("Wrong number of arguments to the UNPACK operator")
+		}
+		rejectNamed("UNPACK operator")
+		return opExpr(sp, ast.OperatorUnpack, children()...)
+	case "try":
+		if len(args) != 1 {
+			raise("Wrong number of arguments provided to TRY expression")
+		}
+		rejectNamed("TRY expression")
+		return opExpr(sp, ast.OperatorTry, children()...)
+	case "construct_array":
+		rejectNamed("array constructors")
+		return opExpr(sp, ast.ArrayConstructor, children()...)
+	case "ifnull":
+		if len(args) != 2 {
+			raise("Wrong number of arguments to IFNULL.")
+		}
+		rejectNamed("IFNULL expressions")
+		return opExpr(sp, ast.OperatorCoalesce, children()...)
+	case "coalesce":
+		if !methodChain {
+			return nil
+		}
+		rejectNamed("COALESCE expressions")
+		return opExpr(sp, ast.OperatorCoalesce, children()...)
+	case "date":
+		if len(args) != 1 {
+			raise("Wrong number of arguments provided to DATE function")
+		}
+		cast := &ast.CastExpression{Child: args[0].Expr, ResolvedType: "DATE"}
+		cast.SetSpan(sp)
+		return cast
+	}
+	return nil
+}
+
+// qualifiedName is a parsed function/type/table qualification: catalog
+// and schema per QualifiedName::Catalog()/Schema(), and the full
+// qualification path when it is deeper than catalog.schema.
+type qualifiedName struct {
+	catalog, schema string
+	path            []string // set only for nested (> 2 component) qualifications
+}
+
+// newQualifiedName ports the QualifiedName(vector<Identifier>
+// qualification, name) constructor's accessors: with one qualifier it is
+// the schema; with two or more the first is the catalog and the last the
+// schema.
+func newQualifiedName(quals []string) qualifiedName {
+	switch len(quals) {
+	case 0:
+		return qualifiedName{}
+	case 1:
+		return qualifiedName{schema: quals[0]}
+	case 2:
+		return qualifiedName{catalog: quals[0], schema: quals[1]}
+	}
+	return qualifiedName{catalog: quals[0], schema: quals[len(quals)-1], path: append([]string{}, quals...)}
+}
+
 // FunctionIdentifier <- CatalogReservedSchemaFunctionName /
 // SchemaReservedFunctionName / FunctionNameAsQualifiedName
-func (tc *transformContext) transformFunctionIdentifier(n tnode) (catalog, schema, name string) {
+// The name is returned as written (callers lowercase it).
+func (tc *transformContext) transformFunctionIdentifier(n tnode) (qualifiedName, string) {
 	_, alt := n.sole().choice()
+	var quals []string
+	var name string
 	switch alt.name() {
 	case "CatalogReservedSchemaFunctionName":
-		// CatalogQualification ReservedSchemaQualification? ReservedFunctionName
-		catalog = identifierText(alt.child(0).child(0))
-		if sq, ok := alt.child(1).opt(); ok {
-			schema = identifierText(sq.child(0))
+		// CatalogQualification ReservedSchemaQualification* ReservedFunctionName
+		quals = append(quals, identifierText(alt.child(0).child(0)))
+		for _, sq := range alt.child(1).repeat() {
+			quals = append(quals, identifierText(sq.child(0)))
 		}
 		name = identifierText(alt.child(2))
 	case "SchemaReservedFunctionName":
-		schema = identifierText(alt.child(0).child(0))
+		quals = append(quals, identifierText(alt.child(0).child(0)))
 		name = identifierText(alt.child(1))
 	case "FunctionNameAsQualifiedName":
 		name = identifierText(alt.sole())
 	default:
 		shapeError(alt, "unknown function identifier")
 	}
-	// a catalog with no schema is really a schema qualification
-	if catalog != "" && schema == "" {
-		catalog, schema = "", catalog
-	}
-	return catalog, schema, strings.ToLower(name)
+	return newQualifiedName(quals), name
 }
 
 // transformFunctionArgumentList handles FunctionExpressionArgumentList
@@ -179,13 +258,22 @@ func (tc *transformContext) transformFunctionIdentifier(n tnode) (catalog, schem
 // DistinctOrAll? FunctionArgumentList? OrderByClause? IgnoreOrRespectNulls?
 func (tc *transformContext) transformFunctionArgumentList(n tnode) functionParts {
 	var parts functionParts
+	list, hasArgs := n.child(1).opt()
+	if hasArgs {
+		for _, argNode := range list.sole().listElems() {
+			parts.args = append(parts.args, tc.transformFunctionArgument(argNode))
+		}
+	}
 	if da, ok := n.child(0).opt(); ok {
 		_, kind := da.sole().choice()
 		parts.distinct = kind.name() == "DistinctKeyword"
-	}
-	if list, ok := n.child(1).opt(); ok {
-		for _, argNode := range list.sole().listElems() {
-			parts.args = append(parts.args, tc.transformFunctionArgument(argNode))
+		if !hasArgs && n.name() == "FunctionExpressionArgumentList" {
+			// TransformFunctionExpressionArgumentList: f(DISTINCT) / f(ALL)
+			// (the method-call list has no such check)
+			if parts.distinct {
+				raise("DISTINCT requires at least one argument")
+			}
+			raise("ALL requires at least one argument")
 		}
 	}
 	if ob, ok := n.child(2).opt(); ok {
@@ -200,18 +288,25 @@ func (tc *transformContext) transformFunctionArgumentList(n tnode) functionParts
 }
 
 // starCallRewrite ports upstream's bare-star call handling: a single
-// unmodified `*` argument of a non-DISTINCT call is dropped.
+// unmodified, unqualified `*` argument of a non-DISTINCT call without
+// ORDER BY is dropped (COUNT(*) is COUNT(); COUNT(t.*) is not).
 func starCallRewrite(parts *functionParts) {
-	if parts.distinct || len(parts.args) != 1 || parts.args[0].Name != "" {
+	if parts.distinct || len(parts.orderBys) > 0 || len(parts.args) != 1 || parts.args[0].Name != "" {
 		return
 	}
 	star, ok := parts.args[0].Expr.(*ast.StarExpression)
-	if !ok || star.Columns || star.RelationName != "" || star.Expr != nil ||
-		len(star.ExcludeList) != 0 || len(star.QualifiedExcludeList) != 0 ||
-		len(star.ReplaceList) != 0 || len(star.RenameList) != 0 {
+	if !ok || !isEmptyStar(star) {
 		return
 	}
 	parts.args = nil
+}
+
+// isEmptyStar ports ExpressionIsUnqualifiedStar: a bare `*` — no
+// relation, no COLUMNS, no EXCLUDE/REPLACE/RENAME.
+func isEmptyStar(star *ast.StarExpression) bool {
+	return !star.Columns && star.RelationName == "" && star.Expr == nil &&
+		len(star.ExcludeList) == 0 && len(star.QualifiedExcludeList) == 0 &&
+		len(star.ReplaceList) == 0 && len(star.RenameList) == 0
 }
 
 // transformFunctionArgumentsInto is the method-call variant used by
@@ -219,6 +314,12 @@ func starCallRewrite(parts *functionParts) {
 // list node.
 func (tc *transformContext) transformFunctionArgumentsInto(argList tnode, name string) *ast.FunctionExpression {
 	parts := tc.transformFunctionArgumentList(argList)
+	if len(parts.args) == 1 && parts.args[0].Name == "" {
+		// TransformMethodExpression: x.count(*) is x.count()
+		if star, ok := parts.args[0].Expr.(*ast.StarExpression); ok && isEmptyStar(star) {
+			parts.args = nil
+		}
+	}
 	if parts.hasNullsOpt {
 		raise("RESPECT/IGNORE NULLS is not supported for non-window functions")
 	}
@@ -235,10 +336,9 @@ func (tc *transformContext) transformFunctionArgument(n tnode) ast.FunctionArgum
 	_, alt := n.sole().choice()
 	switch alt.name() {
 	case "NamedFunctionArgument":
-		// NamedParameter <- TypeFuncName Type? NamedParameterAssignment Expression
-		np := alt.sole()
-		name := identifierText(np.child(0))
-		expr := tc.transformExpression(np.child(3))
+		// NamedFunctionArgument <- TypeFuncName NamedParameterAssignment Expression
+		name := identifierText(alt.child(0))
+		expr := tc.transformExpression(alt.child(2))
 		// upstream also stamps the argument name as the expression alias
 		expr.SetAlias(name)
 		return ast.FunctionArgument{Name: name, Expr: expr}
@@ -253,13 +353,15 @@ func (tc *transformContext) transformFunctionArgument(n tnode) ast.FunctionArgum
 
 // transformOver builds the WindowExpression for a call with an OVER
 // clause.
-func (tc *transformContext) transformOver(n tnode, catalog, schema, name string, parts functionParts, filter ast.Expr, sp ast.Span) ast.Expr {
+func (tc *transformContext) transformOver(n tnode, qn qualifiedName, name string, parts functionParts, filter ast.Expr, sp ast.Span) ast.Expr {
 	if tc.inWindowDefinition {
 		raise("window functions are not allowed in window definitions")
 	}
+	catalog, schema := qn.catalog, qn.schema
 	w := &ast.WindowExpression{
 		Catalog:        catalog,
 		Schema:         schema,
+		Qualification:  qn.path,
 		FunctionName:   name,
 		Arguments:      parts.args,
 		Distinct:       parts.distinct,
@@ -309,7 +411,7 @@ func (tc *transformContext) transformOver(n tnode, catalog, schema, name string,
 func (tc *transformContext) applyNamedWindow(w *ast.WindowExpression, name string) {
 	base := tc.namedWindow(name)
 	if base == nil {
-		raise("window \"%s\" does not exist", name)
+		raise("window %s does not exist", quoteIdent(name))
 	}
 	copyWindowSpec(w, base)
 }
@@ -421,6 +523,10 @@ func (tc *transformContext) transformFrameClause(w *ast.WindowExpression, n tnod
 	switch extent.name() {
 	case "SingleFrameExtent":
 		start, startExpr := tc.transformFrameBound(extent.sole(), kind, true)
+		if frameBoundKind(start) == "EXPR_FOLLOWING" {
+			// TransformSingleFrameExtent
+			raise("Frame starting from following row cannot end with current row")
+		}
 		w.FrameStart, w.StartExpr = start, startExpr
 		switch kind {
 		case "ROWS":
@@ -437,6 +543,14 @@ func (tc *transformContext) transformFrameClause(w *ast.WindowExpression, n tnod
 		w.FrameEnd, w.EndExpr = end, endExpr
 	default:
 		shapeError(extent, "unknown frame extent")
+	}
+	// TransformFrameClause rejects frames that run backwards
+	startKind, endKind := frameBoundKind(w.FrameStart), frameBoundKind(w.FrameEnd)
+	if startKind == "CURRENT_ROW" && endKind == "EXPR_PRECEDING" {
+		raise("Frame starting from current row cannot have preceding rows")
+	}
+	if startKind == "EXPR_FOLLOWING" && (endKind == "CURRENT_ROW" || endKind == "EXPR_PRECEDING") {
+		raise("Frame starting from following row cannot have preceding rows")
 	}
 	// upstream validates the start bound before the end bound
 	if w.FrameStart == ast.WindowUnboundedFollowing {
@@ -487,6 +601,19 @@ func (tc *transformContext) transformFrameBound(n tnode, kind string, isStart bo
 	}
 	shapeError(alt, "unknown frame bound")
 	return "", nil
+}
+
+// frameBoundKind strips the framing suffix from a boundary
+// (EXPR_PRECEDING_ROWS -> EXPR_PRECEDING): upstream checks frame
+// direction on the RANGE spelling before converting to the framing.
+func frameBoundKind(b ast.WindowBoundary) string {
+	s := string(b)
+	for _, suffix := range []string{"_ROWS", "_RANGE", "_GROUPS"} {
+		if strings.HasSuffix(s, suffix) {
+			return strings.TrimSuffix(s, suffix)
+		}
+	}
+	return s
 }
 
 func preceding(n tnode) bool {

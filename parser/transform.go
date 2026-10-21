@@ -176,16 +176,14 @@ func (tc *transformContext) popWindowScope() {
 	tc.windows = tc.windows[:len(tc.windows)-1]
 }
 
-// namedWindow resolves a window name in the innermost scope (window
-// names are case-insensitive identifiers).
+// namedWindow resolves a window name in the innermost scope only
+// (PEGTransformer::GetWindowClause; window names are case-insensitive
+// identifiers).
 func (tc *transformContext) namedWindow(name string) *ast.WindowExpression {
-	key := strings.ToLower(name)
-	for i := len(tc.windows) - 1; i >= 0; i-- {
-		if w, ok := tc.windows[i][key]; ok {
-			return w
-		}
+	if len(tc.windows) == 0 {
+		return nil
 	}
-	return nil
+	return tc.windows[len(tc.windows)-1][strings.ToLower(name)]
 }
 
 func (tc *transformContext) defineWindow(name string, w *ast.WindowExpression) {
@@ -195,7 +193,7 @@ func (tc *transformContext) defineWindow(name string, w *ast.WindowExpression) {
 	scope := tc.windows[len(tc.windows)-1]
 	key := strings.ToLower(name)
 	if _, dup := scope[key]; dup {
-		raise("window \"%s\" is already defined", name)
+		raise("window %s is already defined", quoteIdent(name))
 	}
 	scope[key] = w
 }

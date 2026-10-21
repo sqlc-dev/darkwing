@@ -62,10 +62,14 @@ type ColumnRefExpression struct {
 
 func (e *ColumnRefExpression) Children() []Node { return nil }
 
-// ConstantExpression is a literal value. Port of ConstantExpression.
+// ConstantExpression is a literal atom. Port of ConstantExpression: since
+// DuckDB v2.0 it carries the Literal as written; Value is the literal's
+// value (Literal::ToValue), derived at construction for the
+// transformers' convenience.
 type ConstantExpression struct {
 	exprBase
-	Value Value `json:"value"`
+	Literal Literal `json:"literal"`
+	Value   Value   `json:"value"`
 }
 
 func (e *ConstantExpression) Children() []Node { return nil }
@@ -144,15 +148,19 @@ type FunctionArgument struct {
 // FunctionExpression.
 type FunctionExpression struct {
 	exprBase
-	Catalog      string             `json:"catalog,omitempty"`
-	Schema       string             `json:"schema,omitempty"`
-	FunctionName string             `json:"function_name"`
-	Arguments    []FunctionArgument `json:"arguments"`
-	Distinct     bool               `json:"distinct,omitempty"`
-	IsOperator   bool               `json:"is_operator,omitempty"`
-	ExportState  bool               `json:"export_state,omitempty"`
-	Filter       Expr               `json:"filter,omitempty"`
-	OrderBys     []OrderByNode      `json:"order_bys,omitempty"`
+	Catalog string `json:"catalog,omitempty"`
+	Schema  string `json:"schema,omitempty"`
+	// Qualification is the full qualification path when it is deeper
+	// than catalog.schema (a nested schema chain); Catalog and Schema
+	// then hold QualifiedName::Catalog()/Schema() of it.
+	Qualification []string           `json:"qualification,omitempty"`
+	FunctionName  string             `json:"function_name"`
+	Arguments     []FunctionArgument `json:"arguments"`
+	Distinct      bool               `json:"distinct,omitempty"`
+	IsOperator    bool               `json:"is_operator,omitempty"`
+	ExportState   bool               `json:"export_state,omitempty"`
+	Filter        Expr               `json:"filter,omitempty"`
+	OrderBys      []OrderByNode      `json:"order_bys,omitempty"`
 }
 
 func (e *FunctionExpression) Children() []Node {
@@ -377,9 +385,12 @@ func (e *DefaultExpression) Children() []Node { return nil }
 // alias). Port of upstream's TYPE expression class.
 type TypeExpression struct {
 	exprBase
-	Catalog  string `json:"catalog,omitempty"`
-	Schema   string `json:"schema,omitempty"`
-	TypeName string `json:"type_name"`
+	Catalog string `json:"catalog,omitempty"`
+	Schema  string `json:"schema,omitempty"`
+	// Qualification is the full qualification path when it is deeper
+	// than catalog.schema (see FunctionExpression.Qualification).
+	Qualification []string `json:"qualification,omitempty"`
+	TypeName      string   `json:"type_name"`
 	// Args holds type modifiers (constants) and element types (nested
 	// TypeExpressions; a struct field's name is the child's Alias).
 	Args []Expr `json:"children,omitempty"`
@@ -419,20 +430,23 @@ const (
 // aggregates). Port of WindowExpression.
 type WindowExpression struct {
 	exprBase
-	Type         ExpressionType     `json:"type"`
-	Catalog      string             `json:"catalog,omitempty"`
-	Schema       string             `json:"schema,omitempty"`
-	FunctionName string             `json:"function_name"`
-	Arguments    []FunctionArgument `json:"arguments"`
-	Partitions   []Expr             `json:"partitions,omitempty"`
-	Orders       []OrderByNode      `json:"orders,omitempty"`
-	FrameStart   WindowBoundary     `json:"start"`
-	FrameEnd     WindowBoundary     `json:"end"`
-	StartExpr    Expr               `json:"start_expr,omitempty"`
-	EndExpr      Expr               `json:"end_expr,omitempty"`
-	OffsetExpr   Expr               `json:"offset_expr,omitempty"`
-	DefaultExpr  Expr               `json:"default_expr,omitempty"`
-	IgnoreNulls  bool               `json:"ignore_nulls,omitempty"`
+	Type    ExpressionType `json:"type"`
+	Catalog string         `json:"catalog,omitempty"`
+	Schema  string         `json:"schema,omitempty"`
+	// Qualification is the full qualification path when it is deeper
+	// than catalog.schema (see FunctionExpression.Qualification).
+	Qualification []string           `json:"qualification,omitempty"`
+	FunctionName  string             `json:"function_name"`
+	Arguments     []FunctionArgument `json:"arguments"`
+	Partitions    []Expr             `json:"partitions,omitempty"`
+	Orders        []OrderByNode      `json:"orders,omitempty"`
+	FrameStart    WindowBoundary     `json:"start"`
+	FrameEnd      WindowBoundary     `json:"end"`
+	StartExpr     Expr               `json:"start_expr,omitempty"`
+	EndExpr       Expr               `json:"end_expr,omitempty"`
+	OffsetExpr    Expr               `json:"offset_expr,omitempty"`
+	DefaultExpr   Expr               `json:"default_expr,omitempty"`
+	IgnoreNulls   bool               `json:"ignore_nulls,omitempty"`
 	// HasIgnoreNulls records that IGNORE or RESPECT NULLS was written.
 	HasIgnoreNulls bool                `json:"has_ignore_nulls,omitempty"`
 	Distinct       bool                `json:"distinct,omitempty"`

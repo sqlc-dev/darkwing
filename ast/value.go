@@ -55,3 +55,44 @@ type Value struct {
 	Float64 float64     `json:"float64,omitempty"`
 	Str     string      `json:"str,omitempty"`
 }
+
+// LiteralKind is the syntactic kind of a literal atom, spelled as
+// DuckDB's LiteralKind enum serializes.
+type LiteralKind string
+
+const (
+	LiteralNull    LiteralKind = "NULL_LITERAL"
+	LiteralBoolean LiteralKind = "BOOLEAN"
+	// LiteralInteger is digits with an optional leading '-' and '_'
+	// separators; no '.' and no exponent.
+	LiteralInteger LiteralKind = "INTEGER"
+	// LiteralNumeric is number text with a '.' and/or an exponent.
+	LiteralNumeric LiteralKind = "NUMERIC"
+	// LiteralString is decoded string text (quotes stripped, escapes
+	// decoded).
+	LiteralString LiteralKind = "STRING"
+	// LiteralHex is X'..': the hex digits without prefix and quotes.
+	LiteralHex LiteralKind = "HEX"
+	// LiteralBit is B'..': the bit digits without prefix and quotes.
+	LiteralBit LiteralKind = "BIT"
+)
+
+// Literal is a literal atom as written in the query text — what a
+// ConstantExpression serializes since DuckDB v2.0. Port of
+// duckdb::Literal; it holds no type information (the binder turns it
+// into a Value).
+type Literal struct {
+	Kind LiteralKind `json:"kind"`
+	Text string      `json:"text"`
+}
+
+// IsNumeric reports whether the literal is an INTEGER or NUMERIC atom.
+func (l Literal) IsNumeric() bool { return l.Kind == LiteralInteger || l.Kind == LiteralNumeric }
+
+// Negate toggles the leading '-' of a numeric literal (Literal::Negate).
+func (l Literal) Negate() Literal {
+	if len(l.Text) > 0 && l.Text[0] == '-' {
+		return Literal{Kind: l.Kind, Text: l.Text[1:]}
+	}
+	return Literal{Kind: l.Kind, Text: "-" + l.Text}
+}

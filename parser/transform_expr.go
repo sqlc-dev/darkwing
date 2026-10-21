@@ -41,10 +41,83 @@ func notExpr(sp ast.Span, child ast.Expr) *ast.OperatorExpression {
 	return opExpr(sp, ast.OperatorNot, child)
 }
 
+// constExpr builds the constant for a value the transformer synthesizes
+// (ConstantExpression::FromValue): its literal is the atom that re-binds
+// to the value.
 func constExpr(sp ast.Span, v ast.Value) *ast.ConstantExpression {
-	c := &ast.ConstantExpression{Value: v}
+	c := &ast.ConstantExpression{Value: v, Literal: literalFromValue(v)}
 	c.SetSpan(sp)
 	return c
+}
+
+// literalExpr builds the constant for a literal atom; its Value is
+// derived (Literal::ToValue).
+func literalExpr(sp ast.Span, l ast.Literal) *ast.ConstantExpression {
+	c := &ast.ConstantExpression{Literal: l, Value: literalValue(l)}
+	c.SetSpan(sp)
+	return c
+}
+
+// nullConst is ConstantExpression::Null().
+func nullConst(sp ast.Span) *ast.ConstantExpression {
+	return literalExpr(sp, ast.Literal{Kind: ast.LiteralNull})
+}
+
+// boolConst is ConstantExpression::Boolean().
+func boolConst(sp ast.Span, b bool) *ast.ConstantExpression {
+	return literalExpr(sp, ast.Literal{Kind: ast.LiteralBoolean, Text: strconv.FormatBool(b)})
+}
+
+// intConst is ConstantExpression::Integer().
+func intConst(sp ast.Span, v int64) *ast.ConstantExpression {
+	return literalExpr(sp, ast.Literal{Kind: ast.LiteralInteger, Text: strconv.FormatInt(v, 10)})
+}
+
+// stringConst is ConstantExpression::String().
+func stringConst(sp ast.Span, s string) *ast.ConstantExpression {
+	return literalExpr(sp, ast.Literal{Kind: ast.LiteralString, Text: s})
+}
+
+// literalFromValue picks the literal atom for the scalar values the
+// transformers synthesize (the literal branch of
+// ConstantExpression::FromValue).
+func literalFromValue(v ast.Value) ast.Literal {
+	if v.IsNull || v.Kind == ast.ValueNull {
+		return ast.Literal{Kind: ast.LiteralNull}
+	}
+	switch v.Kind {
+	case ast.ValueBool:
+		return ast.Literal{Kind: ast.LiteralBoolean, Text: strconv.FormatBool(v.Bool)}
+	case ast.ValueInt64, ast.ValueHugeint:
+		s := valueString(v)
+		if v.Type.ID == "DECIMAL" {
+			return ast.Literal{Kind: ast.LiteralNumeric, Text: s}
+		}
+		return ast.Literal{Kind: ast.LiteralInteger, Text: s}
+	case ast.ValueDouble:
+		return ast.Literal{Kind: ast.LiteralNumeric, Text: valueString(v)}
+	}
+	return ast.Literal{Kind: ast.LiteralString, Text: v.Str}
+}
+
+// literalValue ports Literal::ToValue for the transformers' own use.
+func literalValue(l ast.Literal) ast.Value {
+	switch l.Kind {
+	case ast.LiteralBoolean:
+		return ast.Value{Type: ast.LogicalType{ID: "BOOLEAN"}, Kind: ast.ValueBool, Bool: l.Text == "true"}
+	case ast.LiteralInteger, ast.LiteralNumeric:
+		if v, ok := numberValue(l.Text); ok {
+			return v
+		}
+	case ast.LiteralString:
+		return varcharValue(l.Text)
+	case ast.LiteralHex:
+		blob, _ := hexToBlob(l.Text)
+		return ast.Value{Type: ast.LogicalType{ID: "BLOB"}, Kind: ast.ValueString, Str: blob}
+	case ast.LiteralBit:
+		return ast.Value{Type: ast.LogicalType{ID: "BIT"}, Kind: ast.ValueString, Str: l.Text}
+	}
+	return ast.Value{Type: ast.LogicalType{ID: "NULL"}, IsNull: true, Kind: ast.ValueNull}
 }
 
 func varcharValue(s string) ast.Value {
@@ -132,23 +205,109 @@ func appendConjunction(children []ast.Expr, t ast.ExpressionType, e ast.Expr) []
 func (tc *transformContext) transformLogicalNot(n tnode) ast.Expr {
 	expr := tc.transformIs(n.child(1))
 	if notNode, ok := n.child(0).opt(); ok {
-		// NotExpression <- NotKeyword+
-		end := n.span().End
-		nots := notNode.sole().repeat()
-		for i := len(nots) - 1; i >= 0; i-- {
-			expr = notExpr(ast.Span{Start: nots[i].sole().span().Start, End: end}, expr)
-		}
+		expr = applyNotKeywords(notNode, expr, n.span().End)
 	}
 	return expr
 }
 
-// IsExpression <- IsDistinctFromExpression IsTest*
-func (tc *transformContext) transformIs(n tnode) ast.Expr {
-	expr := tc.transformIsDistinctFrom(n.child(0))
-	for _, test := range n.child(1).repeat() {
-		expr = tc.transformIsTest(expr, test)
+// applyNotKeywords ports ApplyNotKeywords: NotExpression <- NotKeyword+
+// wraps the operand in one NOT per keyword, each spanning its keyword
+// through end.
+func applyNotKeywords(notNode tnode, expr ast.Expr, end int) ast.Expr {
+	nots := notNode.sole().repeat()
+	for i := len(nots) - 1; i >= 0; i-- {
+		expr = notExpr(ast.Span{Start: nots[i].sole().span().Start, End: end}, expr)
 	}
 	return expr
+}
+
+// isTail is one IsExpressionTail of upstream's IsExpressionContinuation,
+// tagged with its ExpressionTailType.
+type isTail struct {
+	kind string // IsTestTail / IsDistinctTail / IsComparisonTail / IsOtherOperatorTail / IsCastTail
+	node tnode  // the tail's inner node
+}
+
+// IsExpression <- IsDistinctFromExpression IsExpressionContinuation?
+// IsExpressionContinuation <- IsTest IsExpressionTail*
+// Port of TransformIsExpression: after the first IS test, further IS
+// tests, IS DISTINCT FROM, comparisons, other operators and casts fold
+// left to right; two consecutive DISTINCT or comparison tails are the
+// chained-comparison error. Synthesized nodes carry no location except
+// the outermost, which spans the whole expression.
+func (tc *transformContext) transformIs(n tnode) ast.Expr {
+	expr := tc.transformIsDistinctFrom(n.child(0))
+	cont, ok := n.child(1).opt()
+	if !ok {
+		return expr
+	}
+	tails := []isTail{{kind: "IsTestTail", node: cont.child(0)}}
+	for _, t := range cont.child(1).repeat() {
+		_, alt := t.sole().choice()
+		tails = append(tails, isTail{kind: alt.name(), node: alt.sole()})
+	}
+	// upstream transforms every tail before folding them, so operand
+	// errors precede the chained-comparison check
+	type folded struct {
+		kind string
+		fold func(ast.Expr) ast.Expr
+	}
+	folds := make([]folded, len(tails))
+	for i, t := range tails {
+		t := t
+		switch t.kind {
+		case "IsTestTail":
+			folds[i] = folded{t.kind, func(e ast.Expr) ast.Expr { return tc.transformIsTest(e, t.node) }}
+		case "IsDistinctTail":
+			t2, right := tc.isDistinctFromTail(t.node)
+			folds[i] = folded{t.kind, func(e ast.Expr) ast.Expr {
+				cmp := &ast.ComparisonExpression{Type: t2, Left: e, Right: right}
+				cmp.SetSpan(invalidSpan)
+				return cmp
+			}}
+		case "IsComparisonTail":
+			t2, right := tc.comparisonTail(t.node)
+			folds[i] = folded{t.kind, func(e ast.Expr) ast.Expr {
+				cmp := &ast.ComparisonExpression{Type: t2, Left: e, Right: right}
+				cmp.SetSpan(invalidSpan)
+				return cmp
+			}}
+		case "IsOtherOperatorTail":
+			fold := tc.otherOperatorTail(t.node)
+			folds[i] = folded{t.kind, func(e ast.Expr) ast.Expr { return fold(e, -1, false) }}
+		case "IsCastTail":
+			typ := tc.transformType(t.node.child(1))
+			sp := t.node.span()
+			folds[i] = folded{t.kind, func(e ast.Expr) ast.Expr {
+				cast := &ast.CastExpression{Child: e, CastType: typ}
+				cast.SetSpan(sp)
+				return cast
+			}}
+		default:
+			shapeError(t.node, "unknown IsExpressionTail %q", t.kind)
+		}
+	}
+	prev := "IsTestTail"
+	for _, f := range folds {
+		if f.kind == prev && (f.kind == "IsDistinctTail" || f.kind == "IsComparisonTail") {
+			raise("Chained comparisons are not supported, use AND to combine comparisons")
+		}
+		expr = f.fold(expr)
+		prev = f.kind
+	}
+	// the rule's own location lands on the result when it has none
+	if expr.Pos() < 0 {
+		setSpan(expr, n.span())
+	}
+	return expr
+}
+
+// setSpan sets an expression's location (all AST expressions embed
+// exprBase).
+func setSpan(e ast.Expr, sp ast.Span) {
+	if s, ok := e.(interface{ SetSpan(ast.Span) }); ok {
+		s.SetSpan(sp)
+	}
 }
 
 func (tc *transformContext) transformIsTest(input ast.Expr, n tnode) ast.Expr {
@@ -199,19 +358,44 @@ func (tc *transformContext) transformIsTest(input ast.Expr, n tnode) ast.Expr {
 func (tc *transformContext) transformIsDistinctFrom(n tnode) ast.Expr {
 	expr := tc.transformComparison(n.child(0))
 	for _, tail := range n.child(1).repeat() {
-		// IsDistinctFromTail <- IsDistinctFromOp ComparisonExpression
-		op := tail.child(0) // 'IS' 'NOT'? 'DISTINCT' 'FROM'
-		_, negated := op.child(1).opt()
-		t := ast.CompareDistinctFrom
-		if negated {
-			t = ast.CompareNotDistinctFrom
-		}
-		right := tc.transformComparison(tail.child(1))
+		t, right := tc.isDistinctFromTail(tail)
 		cmp := &ast.ComparisonExpression{Type: t, Left: expr, Right: right}
 		cmp.SetSpan(ast.Span{Start: n.span().Start, End: tail.span().End})
 		expr = cmp
 	}
 	return expr
+}
+
+// IsDistinctFromTail <- IsDistinctFromOp ComparisonExpression
+func (tc *transformContext) isDistinctFromTail(tail tnode) (ast.ExpressionType, ast.Expr) {
+	op := tail.child(0) // 'IS' 'NOT'? 'DISTINCT' 'FROM'
+	_, negated := op.child(1).opt()
+	t := ast.CompareDistinctFrom
+	if negated {
+		t = ast.CompareNotDistinctFrom
+	}
+	return t, tc.transformComparison(tail.child(1))
+}
+
+// ComparisonExpressionTail <- ComparisonOperator ComparisonOperand
+func (tc *transformContext) comparisonTail(tail tnode) (ast.ExpressionType, ast.Expr) {
+	_, opAlt := tail.child(0).sole().choice()
+	t, ok := comparisonOps[opAlt.name()]
+	if !ok {
+		shapeError(opAlt, "unknown comparison operator")
+	}
+	return t, tc.transformComparisonOperand(tail.child(1))
+}
+
+// ComparisonOperand <- NotComparisonOperand / BetweenInLikeExpression
+// NotComparisonOperand <- NotExpression IsExpression: NOT after a
+// comparison operator binds everything up to the IS level.
+func (tc *transformContext) transformComparisonOperand(n tnode) ast.Expr {
+	_, alt := n.sole().choice()
+	if alt.name() == "NotComparisonOperand" {
+		return applyNotKeywords(alt.child(0), tc.transformIs(alt.child(1)), alt.span().End)
+	}
+	return tc.transformBetweenInLike(alt)
 }
 
 var comparisonOps = map[string]ast.ExpressionType{
@@ -235,59 +419,74 @@ func (tc *transformContext) transformComparison(n tnode) ast.Expr {
 		// after transforming the operands - a deeper operand error (e.g.
 		// an empty subscript) takes precedence over the chain ban
 		for _, tail := range tails {
-			tc.transformBetweenInLike(tail.child(2))
+			tc.comparisonTail(tail)
 		}
 		raise("Chained comparisons are not supported, use AND to combine comparisons")
 	}
-	tail := tails[0]
-	_, opAlt := tail.child(0).sole().choice()
-	t, ok := comparisonOps[opAlt.name()]
-	if !ok {
-		shapeError(opAlt, "unknown comparison operator")
-	}
-	right := tc.transformBetweenInLike(tail.child(2))
-	if notNode, hasNot := tail.child(1).opt(); hasNot {
-		nots := notNode.sole().repeat()
-		for i := len(nots) - 1; i >= 0; i-- {
-			right = notExpr(ast.Span{Start: nots[i].sole().span().Start, End: right.End()}, right)
-		}
-	}
+	t, right := tc.comparisonTail(tails[0])
 	cmp := &ast.ComparisonExpression{Type: t, Left: expr, Right: right}
 	cmp.SetSpan(n.span())
 	return cmp
 }
 
-// BetweenInLikeExpression <- OtherOperatorExpression BetweenInLikeOp?
+// BetweenInLikeExpression <- OtherOperatorExpression InPredicate* BetweenLikeOp?
+// InPredicate <- 'NOT'? InClause CastOperator*
+// BetweenLikeOp <- 'NOT'? BetweenLikeOpExpression
+// Port of TransformBetweenInLikeExpression: the IN predicates (each with
+// its trailing casts) apply left to right, then the BETWEEN/LIKE.
+// Synthesized NOT wrappers carry no location except as the outermost
+// result, which takes the whole expression's.
 func (tc *transformContext) transformBetweenInLike(n tnode) ast.Expr {
 	expr := tc.transformOtherOperator(n.child(0))
-	opNode, ok := n.child(1).opt()
-	if !ok {
+	preds := n.child(1).repeat()
+	opNode, hasOp := n.child(2).opt()
+	if len(preds) == 0 && !hasOp {
 		return expr
 	}
-	// BetweenInLikeOp <- 'NOT'? BetweenInLikeOpExpression
-	_, negated := opNode.child(0).opt()
-	_, alt := opNode.child(1).sole().choice()
-	// the whole-expression span, used by the NOT wrapper
-	wholeSp := ast.Span{Start: n.span().Start, End: alt.span().End}
-	var result ast.Expr
-	switch alt.name() {
-	case "BetweenClause":
-		lower := tc.transformOtherOperator(alt.child(1))
-		upper := tc.transformOtherOperator(alt.child(3))
-		b := &ast.BetweenExpression{Input: expr, Lower: lower, Upper: upper}
-		b.SetSpan(alt.span())
-		result = b
-	case "InClause":
-		result = tc.transformInClause(expr, alt)
-	case "LikeClause":
-		result = tc.transformLikeClause(expr, alt, negated, wholeSp)
-		// like handles its own negation
-		return result
+	whole := n.span()
+	for _, p := range preds {
+		_, negated := p.child(0).opt()
+		expr = tc.transformInClause(expr, p.child(1))
+		if negated {
+			expr = notExpr(invalidSpan, expr)
+		}
+		for _, c := range p.child(2).repeat() {
+			cast := &ast.CastExpression{Child: expr, CastType: tc.transformType(c.child(1))}
+			cast.SetSpan(c.span())
+			expr = cast
+		}
 	}
-	if negated {
-		result = notExpr(wholeSp, result)
+	if hasOp {
+		_, negated := opNode.child(0).opt()
+		_, alt := opNode.child(1).sole().choice()
+		switch alt.name() {
+		case "BetweenClause":
+			// 'BETWEEN' Asymmetric? OtherOperatorExpression 'AND' OtherOperatorExpression
+			lower := tc.transformOtherOperator(alt.child(2))
+			upper := tc.transformOtherOperator(alt.child(4))
+			b := &ast.BetweenExpression{Input: expr, Lower: lower, Upper: upper}
+			b.SetSpan(alt.span())
+			expr = b
+			if negated {
+				expr = notExpr(invalidSpan, expr)
+			}
+		case "LikeClause":
+			_, variation := alt.child(0).sole().choice()
+			// like handles its own negation
+			expr = tc.transformLikeClause(expr, alt, negated, invalidSpan)
+			if negated && strings.HasPrefix(variation.name(), "Not") {
+				// TransformBetweenLikeOp: the variation's function is
+				// already negated ("!~~", "!~~*", "!regexp_matches")
+				raise("NOT cannot precede an operator that is already negated (!~~, !~~*, !~ or !~*)")
+			}
+		default:
+			shapeError(alt, "unknown BetweenLikeOpExpression")
+		}
 	}
-	return result
+	if expr.Pos() < 0 {
+		setSpan(expr, whole)
+	}
+	return expr
 }
 
 // InClause <- 'IN' InExpression: the result's location is the IN target
@@ -440,33 +639,86 @@ func comparisonFromOpText(op string) (ast.ExpressionType, bool) {
 	return "", false
 }
 
-// OtherOperatorExpression <- BitwiseExpression OtherOperatorTail*
+// OtherOperatorExpression <- InfixOtherOperatorExpression / CustomPrefixExpression
 func (tc *transformContext) transformOtherOperator(n tnode) ast.Expr {
+	_, alt := n.sole().choice()
+	switch alt.name() {
+	case "InfixOtherOperatorExpression":
+		return tc.transformInfixOtherOperator(alt)
+	case "CustomPrefixExpression":
+		// CustomPrefixExpression <- OperatorLiteral OtherOperatorExpression
+		operand := tc.transformOtherOperator(alt.child(1))
+		return operatorFunction(alt.span(), keywordOfOp(alt.child(0)), operand)
+	}
+	shapeError(alt, "unknown OtherOperatorExpression alternative")
+	return nil
+}
+
+// InfixOtherOperatorExpression <- BitwiseExpression OtherOperatorTail*
+func (tc *transformContext) transformInfixOtherOperator(n tnode) ast.Expr {
 	expr := tc.transformBitwise(n.child(0))
 	tails := n.child(1).repeat()
+	folds := make([]func(ast.Expr, int, bool) ast.Expr, len(tails))
 	for i, tail := range tails {
-		_, opAlt := tail.child(0).sole().choice()
-		rhsNode := tail.child(1)
-		outermost := i == len(tails)-1
-		switch opAlt.name() {
-		case "AnyAllParsedOperator":
-			expr = tc.transformAnyAll(expr, opAlt.sole(), rhsNode, n.span().Start)
-		case "NamedOtherOperator":
-			expr = tc.transformNamedOperator(expr, opAlt.sole(), rhsNode, n.span().Start, outermost)
-		default:
-			shapeError(opAlt, "unknown other-operator")
-		}
+		folds[i] = tc.otherOperatorTail(tail)
+	}
+	for i, fold := range folds {
+		expr = fold(expr, n.span().Start, i == len(tails)-1)
 	}
 	return expr
 }
 
-// AnyAllOperator <- AnyOp AnyOrAll
-func (tc *transformContext) transformAnyAll(input ast.Expr, n tnode, rhsNode tnode, exprStart int) ast.Expr {
+// otherOperatorTail transforms OtherOperatorTail <- OtherOperator
+// BitwiseExpression and returns the fold applying it to a left operand.
+// exprStart < 0 means the fold's result gets no location of its own.
+func (tc *transformContext) otherOperatorTail(tail tnode) func(ast.Expr, int, bool) ast.Expr {
+	_, opAlt := tail.child(0).sole().choice()
+	rhsNode := tail.child(1)
+	rhs := tc.transformBitwise(rhsNode)
+	end := rhsNode.span().End
+	span := func(exprStart int, outermost bool) ast.Span {
+		if exprStart < 0 || !outermost {
+			return invalidSpan
+		}
+		return ast.Span{Start: exprStart, End: end}
+	}
+	switch opAlt.name() {
+	case "AnyAllParsedOperator":
+		return func(input ast.Expr, exprStart int, outermost bool) ast.Expr {
+			whole := ast.Span{Start: exprStart, End: end}
+			if exprStart < 0 {
+				whole = invalidSpan
+			}
+			return tc.transformAnyAll(input, opAlt.sole(), rhs, whole)
+		}
+	case "NamedOtherOperator":
+		return func(input ast.Expr, exprStart int, outermost bool) ast.Expr {
+			return tc.transformNamedOperator(input, opAlt.sole(), rhs, span(exprStart, outermost))
+		}
+	}
+	shapeError(opAlt, "unknown other-operator")
+	return nil
+}
+
+// operatorFunction ports TransformOperatorFunction: an operator call,
+// "schema.op" splitting into a schema-qualified call.
+func operatorFunction(sp ast.Span, name string, args ...ast.Expr) *ast.FunctionExpression {
+	parts := strings.Split(name, ".")
+	if len(parts) > 2 {
+		raise("Too many identifiers found, expected schema.operator or operator")
+	}
+	f := opCall(sp, parts[len(parts)-1], args...)
+	if len(parts) == 2 {
+		f.Schema = parts[0]
+	}
+	return f
+}
+
+// AnyAllOperator <- AnyOperatorLiteral AnyOrAll
+func (tc *transformContext) transformAnyAll(input ast.Expr, n tnode, rhs ast.Expr, whole ast.Span) ast.Expr {
 	opText := keywordOfOp(n.child(0))
 	_, anyOrAll := n.child(1).sole().choice()
 	isAll := anyOrAll.name() == "SubqueryAll"
-	rhs := tc.transformBitwise(rhsNode)
-	whole := ast.Span{Start: exprStart, End: rhsNode.span().End}
 	cmp, ok := comparisonFromOpText(opText)
 	if !ok {
 		if sub, isSub := rhs.(*ast.SubqueryExpression); isSub && sub.SubqueryType == ast.SubqueryScalar {
@@ -584,17 +836,11 @@ func regexAnyAll(input, list ast.Expr, opText string, isAll bool, whole ast.Span
 	return out
 }
 
-// NamedOtherOperator <- QualifiedOperator / InetOperator / JsonOperator /
-// ListOperator / StringOperator / OperatorLiteral
+// NamedOtherOperator <- QualifiedOperator / OperatorLiteral
 // Only the outermost fold of a chain carries a location, like the binary
 // ladder levels.
-func (tc *transformContext) transformNamedOperator(input ast.Expr, n tnode, rhsNode tnode, exprStart int, outermost bool) ast.Expr {
+func (tc *transformContext) transformNamedOperator(input ast.Expr, n tnode, rhs ast.Expr, sp ast.Span) ast.Expr {
 	_, alt := n.choice()
-	rhs := tc.transformBitwise(rhsNode)
-	sp := invalidSpan
-	if outermost {
-		sp = ast.Span{Start: exprStart, End: rhsNode.span().End}
-	}
 	if alt.name() == "QualifiedOperator" {
 		// OPERATOR(schema.op) is always a function call — comparison
 		// spellings included — with the qualifier as its schema
@@ -603,18 +849,12 @@ func (tc *transformContext) transformNamedOperator(input ast.Expr, n tnode, rhsN
 		f.Schema = schema
 		return f
 	}
-	var opText string
-	switch alt.name() {
-	case "InetOperator", "JsonOperator", "ListOperator", "StringOperator":
-		opText = keywordOfOp(alt.sole())
-	default:
-		// OperatorLiteral: a free operator token
-		op, ok := alt.r.(*matcher.OperatorResult)
-		if !ok {
-			shapeError(alt, "want operator literal, got %T", alt.r)
-		}
-		opText = op.Operator
+	// OperatorLiteral: a free operator token
+	op, ok := alt.r.(*matcher.OperatorResult)
+	if !ok {
+		shapeError(alt, "want operator literal, got %T", alt.r)
 	}
+	opText := op.Operator
 	if cmp, isCmp := comparisonFromOpText(opText); isCmp {
 		c := &ast.ComparisonExpression{Type: cmp, Left: input, Right: rhs}
 		c.SetSpan(sp)
@@ -680,6 +920,9 @@ func keywordOfOp(n tnode) string {
 	switch r := n.r.(type) {
 	case *matcher.KeywordResult:
 		return r.Keyword
+	case *matcher.OperatorResult:
+		// OperatorLiteral / AnyOperatorLiteral
+		return r.Operator
 	case *matcher.ListResult:
 		if len(r.Children) == 1 {
 			return keywordOfOp(tnode{r.Children[0]})
@@ -691,8 +934,26 @@ func keywordOfOp(n tnode) string {
 	return ""
 }
 
+// BitwiseExpression <- TildeExpression BitwiseExpressionTail*
 func (tc *transformContext) transformBitwise(n tnode) ast.Expr {
-	return tc.binaryLadder(n, tc.transformAdditive, false)
+	return tc.binaryLadder(n, tc.transformTilde, false)
+}
+
+// TildeExpression <- TildePrefixOperator* AdditiveExpression
+// Port of TransformTildeExpression: bitwise NOT binds looser than
+// arithmetic (~a + b is ~(a + b)); only the outermost operator carries
+// a location, the whole expression's.
+func (tc *transformContext) transformTilde(n tnode) ast.Expr {
+	expr := tc.transformAdditive(n.child(1))
+	ops := n.child(0).repeat()
+	for i := len(ops) - 1; i >= 0; i-- {
+		sp := invalidSpan
+		if i == 0 {
+			sp = n.span()
+		}
+		expr = operatorFunction(sp, "~", expr)
+	}
+	return expr
 }
 
 func (tc *transformContext) transformAdditive(n tnode) ast.Expr {
@@ -820,15 +1081,15 @@ func (tc *transformContext) transformPrefix(n tnode) ast.Expr {
 		}
 		switch alt.name() {
 		case "MinusPrefixOperator":
-			if folded, ok := negateConstant(expr, alt.span().Start, end, i == 0); ok {
-				expr = folded
+			// fold the sign into the number text so
+			// -9223372036854775808 stays exact (Literal::Negate)
+			if c, ok := expr.(*ast.ConstantExpression); ok && c.Literal.IsNumeric() {
+				expr = literalExpr(sp, c.Literal.Negate())
 				continue
 			}
 			expr = opCall(sp, "-", expr)
 		case "PlusPrefixOperator":
 			expr = opCall(sp, "+", expr)
-		case "TildePrefixOperator":
-			expr = opCall(sp, "~", expr)
 		case "QualifiedOperator":
 			// the prefix form folds qualifiers into the name itself:
 			// OPERATOR(main.-) x calls "main.-", mirroring upstream
@@ -843,57 +1104,6 @@ func (tc *transformContext) transformPrefix(n tnode) ast.Expr {
 		}
 	}
 	return expr
-}
-
-// negateConstant folds `-literal` into a negative constant, mirroring
-// upstream's constant folding for numeric literals; the folded constant's
-// location grows to include the minus sign.
-func negateConstant(e ast.Expr, opStart, end int, outermost bool) (ast.Expr, bool) {
-	c, ok := e.(*ast.ConstantExpression)
-	if !ok {
-		return nil, false
-	}
-	v := c.Value
-	switch v.Kind {
-	case ast.ValueInt64:
-		v.Int64 = -v.Int64
-	case ast.ValueDouble:
-		v.Float64 = -v.Float64
-	case ast.ValueHugeint:
-		v.Hugeint = negateHugeint(v.Hugeint)
-		if v.Type.ID == "UHUGEINT" {
-			// -(2^127) is representable as HUGEINT; larger magnitudes
-			// stay unfolded
-			if uint64(v.Hugeint.Upper) < 1<<63 && !(v.Hugeint.Upper == 0 && v.Hugeint.Lower == 0) {
-				return nil, false
-			}
-			v.Type = ast.LogicalType{ID: "HUGEINT"}
-		}
-		// a negated HUGEINT that now fits an int64 demotes (the INT64_MIN
-		// literal is only representable negated) — but only when this
-		// minus is the outermost prefix operator
-		if outermost && v.Hugeint.Upper == -1 && v.Hugeint.Lower >= 1<<63 {
-			v.Kind = ast.ValueInt64
-			v.Int64 = int64(v.Hugeint.Lower)
-			v.Hugeint = ast.Hugeint{}
-		}
-	default:
-		return nil, false
-	}
-	// negating can shrink or widen the integer class (e.g. the INT32_MIN
-	// literal is only representable negated); DECIMAL keeps its type
-	if v.Kind == ast.ValueInt64 && v.Type.ID != "DECIMAL" {
-		v.Type = ast.LogicalType{ID: integerTypeFor(v.Int64)}
-	}
-	out := &ast.ConstantExpression{Value: v}
-	if outermost {
-		// the folded constant spans the operator through the operand
-		// (parentheses included)
-		out.SetSpan(ast.Span{Start: opStart, End: end})
-	} else {
-		out.SetSpan(invalidSpan)
-	}
-	return out, true
 }
 
 func negateHugeint(h ast.Hugeint) ast.Hugeint {
@@ -998,23 +1208,39 @@ func (tc *transformContext) transformDot(base ast.Expr, n tnode, baseStart int, 
 		}
 		f.SetSpan(method.span())
 		f.Arguments = append([]ast.FunctionArgument{{Expr: base}}, f.Arguments...)
+		// a method-chained call names a function too, so it takes the
+		// same rewrites (TransformBaseExpression); the rewritten node has
+		// no location unless it is the base expression's result
+		sp := invalidSpan
+		if last {
+			sp = ast.Span{Start: baseStart, End: alt.span().End}
+		}
+		if out := parserFunctionRewrite(sp, f.FunctionName, f.Arguments, true); out != nil {
+			upper := strings.ToUpper(f.FunctionName)
+			if f.Distinct {
+				raise("DISTINCT is not supported in %s expressions", upper)
+			}
+			if len(f.OrderBys) > 0 {
+				raise("ORDER BY is not supported in %s expressions", upper)
+			}
+			return out, false
+		}
 		return f, false
 	}
 	shapeError(alt, "unknown dot operator")
 	return nil, false
 }
 
-// emptyListValue is the sentinel constant upstream uses for omitted slice
-// bounds: an empty LIST(INTEGER).
-func emptyListValue(sp ast.Span) *ast.ConstantExpression {
-	return constExpr(sp, ast.Value{
-		Type: ast.LogicalType{ID: "LIST", Child: &ast.LogicalType{ID: "INTEGER"}},
-		Kind: ast.ValueEmptyList,
-	})
+// emptySliceBound ports OperatorExpression::EmptySliceBound: an omitted
+// slice bound is the call list_value() (v2.0; formerly an empty
+// INTEGER[] constant).
+func emptySliceBound(sp ast.Span) *ast.FunctionExpression {
+	return fnCall(sp, "list_value")
 }
 
 // SliceExpression <- '[' SliceBound ']'
-// SliceBound <- Expression? EndSliceBound? StepSliceBound?
+// SliceBound <- Expression? SliceUpperBound?
+// SliceUpperBound <- MinusStepSliceBound / EndStepSliceBound
 func (tc *transformContext) transformSlice(base ast.Expr, n tnode) ast.Expr {
 	bound := n.child(1)
 	// the slice operator's location is the bracketed subscript itself
@@ -1023,41 +1249,41 @@ func (tc *transformContext) transformSlice(base ast.Expr, n tnode) ast.Expr {
 	if s, ok := bound.child(0).opt(); ok {
 		start = tc.transformExpression(s)
 	}
-	endBound, hasEnd := bound.child(1).opt()
-	if !hasEnd {
+	upper, hasUpper := bound.child(1).opt()
+	if !hasUpper {
 		if start == nil {
 			raise("Empty subscript '[]' is not allowed")
 		}
 		return opExpr(sp, ast.ArrayExtract, base, start)
 	}
-	// an omitted start bound has no location; an omitted end bound sits
-	// on the ':'
-	colon := endBound.child(0).span()
-	sentinelSpan := ast.Span{Start: colon.Start, End: colon.Start + 1}
+	// an omitted start bound has no location
 	if start == nil {
-		start = emptyListValue(invalidSpan)
+		start = emptySliceBound(invalidSpan)
 	}
-	// EndSliceBound <- ':' EndSliceValue?
-	var end ast.Expr
-	if ev, ok := endBound.child(1).opt(); ok {
-		_, alt := ev.sole().choice()
-		if alt.name() == "EndSliceMinus" {
-			// explicit '-': open end, sentinel located on the '-'
-			minus := alt.sole().span()
-			end = emptyListValue(ast.Span{Start: minus.Start, End: minus.Start + 1})
-		} else {
-			end = tc.transformExpression(alt)
+	children := []ast.Expr{base, start}
+	_, alt := upper.sole().choice()
+	switch alt.name() {
+	case "MinusStepSliceBound":
+		// ':' '-' StepSliceBound: an explicit open end, location-free
+		children = append(children, emptySliceBound(invalidSpan), tc.sliceBoundValue(alt.child(2)))
+	case "EndStepSliceBound":
+		// EndSliceBound StepSliceBound?
+		children = append(children, tc.sliceBoundValue(alt.child(0)))
+		if step, ok := alt.child(1).opt(); ok {
+			children = append(children, tc.sliceBoundValue(step))
 		}
-	}
-	if end == nil {
-		end = emptyListValue(sentinelSpan)
-	}
-	children := []ast.Expr{base, start, end}
-	if stepBound, ok := bound.child(2).opt(); ok {
-		// StepSliceBound <- ':' Expression?
-		if sv, ok := stepBound.child(1).opt(); ok {
-			children = append(children, tc.transformExpression(sv))
-		}
+	default:
+		shapeError(alt, "unknown SliceUpperBound")
 	}
 	return opExpr(sp, ast.ArraySlice, children...)
+}
+
+// sliceBoundValue transforms EndSliceBound / StepSliceBound <- ':'
+// Expression?: an omitted expression is the empty slice bound, located
+// on the ':'.
+func (tc *transformContext) sliceBoundValue(n tnode) ast.Expr {
+	if e, ok := n.child(1).opt(); ok {
+		return tc.transformExpression(e)
+	}
+	return emptySliceBound(n.span())
 }

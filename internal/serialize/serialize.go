@@ -122,6 +122,8 @@ func queryNode(n ast.QueryNode) map[string]any {
 		base["table"] = ins.Table
 		base["schema"] = ins.Schema
 		base["catalog"] = ins.Catalog
+		// v2.0 storage also writes the target's QualifiedName
+		base["qualified_name"] = map[string]any{"path": qualifiedPath(ins.Catalog, ins.Schema, nil, ins.Table)}
 		base["returning_list"] = exprList(ins.Returning)
 		base["on_conflict_info"] = onConflictInfo(ins.OnConflict)
 		// upstream materializes the insert target as a table ref only

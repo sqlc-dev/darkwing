@@ -498,7 +498,8 @@ func normalizeSet(s ast.GroupingSet) ast.GroupingSet {
 	return out
 }
 
-// peekBareStar reports whether a GroupByExpression entry is a bare `*`.
+// peekBareStar reports whether a GroupByExpression entry is a bare `*`
+// (ExpressionIsEmptyStar: a qualified `t.*` counts too).
 func (tc *transformContext) peekBareStar(n tnode) (bool, bool) {
 	_, alt := n.sole().choice()
 	if alt.name() != "GroupByBaseExpression" {
@@ -506,7 +507,7 @@ func (tc *transformContext) peekBareStar(n tnode) (bool, bool) {
 	}
 	expr := tc.transformExpression(alt.sole())
 	star, ok := expr.(*ast.StarExpression)
-	if !ok || star.Columns || star.Expr != nil || star.RelationName != "" ||
+	if !ok || star.Columns || star.Expr != nil ||
 		len(star.ExcludeList) != 0 || len(star.ReplaceList) != 0 ||
 		len(star.QualifiedExcludeList) != 0 || len(star.RenameList) != 0 {
 		return false, false

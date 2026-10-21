@@ -211,13 +211,19 @@ func (tc *transformContext) transformLogicalNot(n tnode) ast.Expr {
 }
 
 // applyNotKeywords ports ApplyNotKeywords: NotExpression <- NotKeyword+
-// wraps the operand in one NOT per keyword, each spanning its keyword
-// through end.
+// wraps the operand in one NOT per keyword; the outermost spans the first
+// keyword through end.
 func applyNotKeywords(notNode tnode, expr ast.Expr, end int) ast.Expr {
 	nots := notNode.sole().repeat()
 	stackCheck(len(nots))
 	for i := len(nots) - 1; i >= 0; i-- {
-		expr = notExpr(ast.Span{Start: nots[i].sole().span().Start, End: end}, expr)
+		// the NOTs are built in one transform: only the outermost takes
+		// the rule's location
+		sp := invalidSpan
+		if i == 0 {
+			sp = ast.Span{Start: nots[i].sole().span().Start, End: end}
+		}
+		expr = notExpr(sp, expr)
 	}
 	return expr
 }

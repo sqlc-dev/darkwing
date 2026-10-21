@@ -367,7 +367,7 @@ func TestComments(t *testing.T) {
 }
 
 func TestPrecedingTrivia(t *testing.T) {
-	got, err := Tokenize("SELECT 'a'\n'b' /* c */ 'd'\n/* e */\n'f' -- g\n'h' x")
+	got, err := Tokenize("SELECT 'a'\n'b' /* c */ 'd'\n/* e */\n'f' -- g\n'h'\nx")
 	if err != nil {
 		t.Fatal(err)
 	}

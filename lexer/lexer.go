@@ -672,5 +672,13 @@ func (l *lexer) run() error {
 	if state == stateKeyword && !token.IsKeyword(lastWord) {
 		state = stateStandard
 	}
-	return l.pushRange(lastPos, n, stateToKind(state), isUnterminatedState(state))
+	// TokenizerBehavior::OnLastToken appends the token directly, bypassing
+	// PushToken and its preceding-trivia flags
+	l.tokens = append(l.tokens, token.Token{
+		Kind:         stateToKind(state),
+		Text:         lastWord,
+		Span:         token.Span{Start: lastPos, End: n},
+		Unterminated: isUnterminatedState(state),
+	})
+	return nil
 }

@@ -248,6 +248,7 @@ func oracleSerialize(bin string, sqls []string) ([]string, error) {
 		fmt.Fprintf(&script, "SELECT json_serialize_sql('%s') AS j;\n", escaped)
 	}
 	cmd := exec.Command(bin, "-batch", "-noheader", "-list", ":memory:")
+	cmd.Env = duckdbsrc.Env()
 	cmd.Stdin = &script
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout

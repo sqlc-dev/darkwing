@@ -24,10 +24,11 @@ type KeywordList struct {
 	RuleName string
 }
 
-// KeywordLists enumerates the five vendored keyword lists in the order the
+// KeywordLists enumerates the six vendored keyword lists in the order the
 // assembly step visits them (sorted by file name, as upstream does).
 func KeywordLists() []KeywordList {
 	return []KeywordList{
+		{File: "bare_label_keyword.list", RuleName: "BareLabelKeyword"},
 		{File: "column_name_keyword.list", RuleName: "ColumnNameKeyword"},
 		{File: "func_name_keyword.list", RuleName: "FuncNameKeyword"},
 		{File: "reserved_keyword.list", RuleName: "ReservedKeyword"},

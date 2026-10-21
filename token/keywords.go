@@ -31,6 +31,10 @@ const (
 	// func-name keywords, as function names (upstream folds both lists
 	// into its type/func map).
 	KeywordTypeName
+	// KeywordBareLabel keywords may be used as a column alias without AS
+	// (BareColLabel). The classification is orthogonal: every bare-label
+	// keyword is also an unreserved or column-name keyword.
+	KeywordBareLabel
 
 	// KeywordNone means the word is not a keyword.
 	KeywordNone KeywordCategory = 0
@@ -55,6 +59,7 @@ func (c KeywordCategory) String() string {
 		{KeywordColumnName, "column_name"},
 		{KeywordFuncName, "func_name"},
 		{KeywordTypeName, "type_name"},
+		{KeywordBareLabel, "bare_label"},
 	} {
 		if c.Has(entry.bit) {
 			parts = append(parts, entry.name)
@@ -84,6 +89,8 @@ func listCategory(file string) KeywordCategory {
 		return KeywordFuncName
 	case "type_name_keyword.list":
 		return KeywordTypeName
+	case "bare_label_keyword.list":
+		return KeywordBareLabel
 	default:
 		return KeywordNone
 	}
@@ -103,10 +110,14 @@ func keywords() map[string]KeywordCategory {
 				m[w] |= category
 			}
 		}
-		// the only disjointness upstream's build script enforces
+		// the consistency checks upstream's build script enforces
 		for w, c := range m {
 			if c.Has(KeywordReserved) && c.Has(KeywordUnreserved) {
 				keywordErr = fmt.Errorf("keyword %q has conflicting RESERVED/UNRESERVED categories", w)
+				return
+			}
+			if c.Has(KeywordBareLabel) && !c.Has(KeywordUnreserved) && !c.Has(KeywordColumnName) {
+				keywordErr = fmt.Errorf("bare label keyword %q is not an unreserved or column-name keyword", w)
 				return
 			}
 		}

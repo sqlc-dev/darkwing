@@ -1,4 +1,4 @@
-duckdb
+/duckdb
 *.db
 *.db.wal
 *.zip

@@ -21,6 +21,10 @@ const (
 	// classTypeName allows unreserved + type-name keywords (type name
 	// positions).
 	classTypeName
+	// classBareLabel allows only bare-label keywords (column aliases
+	// without AS); unlike the other classes, unreserved keywords outside
+	// the bare-label list are rejected.
+	classBareLabel
 )
 
 // identifierMatcher matches identifier tokens with category-aware keyword
@@ -90,6 +94,10 @@ func (m *identifierMatcher) isAllowedKeyword(text string) bool {
 	categories := token.Categories(text)
 	if categories == token.KeywordNone {
 		return true
+	}
+	// DefaultKeywordMaps::GetIdentifierMask
+	if m.class == classBareLabel {
+		return categories.Has(token.KeywordBareLabel)
 	}
 	if categories.Has(token.KeywordUnreserved) {
 		return true

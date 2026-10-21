@@ -343,6 +343,7 @@ func (f *factory) installOverrides() {
 
 	f.addRuleOverride("Identifier", ident(classColumnName, false, "VARIABLE"))
 	f.addRuleOverride("ReservedIdentifier", reserved(false, "VARIABLE"))
+	f.addRuleOverride("BareColLabel", ident(classBareLabel, false, "?VARIABLE?"))
 	f.addRuleOverride("CatalogName", ident(classColumnName, false, "CATALOG_NAME"))
 	f.addRuleOverride("SchemaName", ident(classColumnName, false, "SCHEMA_NAME"))
 	f.addRuleOverride("ReservedSchemaName", reserved(false, "SCHEMA_NAME"))
@@ -375,7 +376,7 @@ func (f *factory) installOverrides() {
 // cross-check the override table against the vendored grammar.
 func OverrideRuleNames() []string {
 	return []string{
-		"Identifier", "ReservedIdentifier", "CatalogName", "SchemaName",
+		"Identifier", "ReservedIdentifier", "BareColLabel", "CatalogName", "SchemaName",
 		"ReservedSchemaName", "TableName", "ReservedTableName", "ColumnName",
 		"ReservedColumnName", "IndexName", "ReservedIndexName", "SequenceName",
 		"FunctionName", "ReservedFunctionName", "ReservedKeyword",

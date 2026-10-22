@@ -7,7 +7,7 @@ in `internal/grammar/README.md`.
 
 ## Layout
 
-- `token/` — token kinds, `Token{Kind, Text, Span}`, the five keyword
+- `token/` — token kinds, `Token{Kind, Text, Span}`, the six keyword
   categories (built from the vendored `.list` files).
 - `lexer/` — port of `base_tokenizer.cpp` + `parser_tokenizer.cpp`.
 - `internal/grammar/` — vendored `.gram`/`.list` files (never edit them by
@@ -113,7 +113,7 @@ DARKWING_DUCKDB=/path/to/duckdb-cli go run ./cmd/serialize-diff -corpus
 ```
 
 Regenerating the corpus (needs a DuckDB checkout at the pinned commit and
-the matching nightly CLI; see `internal/grammar/README.md` for the pin):
+the matching release CLI; see `internal/grammar/README.md` for the pin):
 
 ```
 DARKWING_DUCKDB=/path/to/duckdb-cli \

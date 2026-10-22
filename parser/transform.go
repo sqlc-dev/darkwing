@@ -38,6 +38,9 @@ type transformContext struct {
 	// parameters had been seen when such an entry was recorded.
 	pivotEntries        int
 	pivotEntryHasParams bool
+	// pivotFirstColumn renders the first such entry's pivot column
+	// (pivot_entries[0]->column->ToString()) for pivotEntryCheck.
+	pivotFirstColumn string
 }
 
 // pivotEntryCheck ports PEGTransformer::PivotEntryCheck: CREATE VIEW and
@@ -47,7 +50,7 @@ func (tc *transformContext) pivotEntryCheck(kind string) {
 	if tc.pivotEntries > 0 {
 		raise("PIVOT statements with pivot elements extracted from the data cannot be used in %ss.\n"+
 			"In order to use PIVOT in a %s the PIVOT values must be manually specified, e.g.:\n"+
-			"PIVOT ... ON ... IN (val1, val2, ...)", kind, kind)
+			"PIVOT ... ON %s IN (val1, val2, ...)", kind, kind, tc.pivotFirstColumn)
 	}
 }
 
@@ -74,6 +77,7 @@ func register(rule string, fn stmtTransform) {
 // wrapping a choice of statement rules).
 func (tc *transformContext) transformStatement(n tnode) ast.Stmt {
 	_, inner := n.sole().choice()
+	checkExpressionDepth(inner.r)
 	if fn, ok := statementTransforms[inner.name()]; ok {
 		return fn(tc, inner)
 	}
@@ -176,16 +180,14 @@ func (tc *transformContext) popWindowScope() {
 	tc.windows = tc.windows[:len(tc.windows)-1]
 }
 
-// namedWindow resolves a window name in the innermost scope (window
-// names are case-insensitive identifiers).
+// namedWindow resolves a window name in the innermost scope only
+// (PEGTransformer::GetWindowClause; window names are case-insensitive
+// identifiers).
 func (tc *transformContext) namedWindow(name string) *ast.WindowExpression {
-	key := strings.ToLower(name)
-	for i := len(tc.windows) - 1; i >= 0; i-- {
-		if w, ok := tc.windows[i][key]; ok {
-			return w
-		}
+	if len(tc.windows) == 0 {
+		return nil
 	}
-	return nil
+	return tc.windows[len(tc.windows)-1][strings.ToLower(name)]
 }
 
 func (tc *transformContext) defineWindow(name string, w *ast.WindowExpression) {
@@ -195,7 +197,7 @@ func (tc *transformContext) defineWindow(name string, w *ast.WindowExpression) {
 	scope := tc.windows[len(tc.windows)-1]
 	key := strings.ToLower(name)
 	if _, dup := scope[key]; dup {
-		raise("window \"%s\" is already defined", name)
+		raise("window %s is already defined", quoteIdent(name))
 	}
 	scope[key] = w
 }

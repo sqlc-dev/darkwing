@@ -31,8 +31,12 @@ func (a *AtClause) Children() []Node { return add(nil, a.Expr) }
 // BaseTableRef.
 type BaseTableRef struct {
 	tableRefBase
-	CatalogName     string    `json:"catalog_name,omitempty"`
-	SchemaName      string    `json:"schema_name,omitempty"`
+	CatalogName string `json:"catalog_name,omitempty"`
+	SchemaName  string `json:"schema_name,omitempty"`
+	// Qualification is the full qualification path when it is deeper
+	// than catalog.schema (a nested schema chain, DuckDB v2.0);
+	// CatalogName/SchemaName then hold QualifiedName::Catalog()/Schema().
+	Qualification   []string  `json:"qualification,omitempty"`
 	TableName       string    `json:"table_name"`
 	ColumnNameAlias []string  `json:"column_name_alias,omitempty"`
 	At              *AtClause `json:"at_clause,omitempty"`
@@ -182,10 +186,15 @@ func (t *PivotRef) Children() []Node {
 type ShowType string
 
 const (
-	ShowTypeDescribe        ShowType = "DESCRIBE"
-	ShowTypeSummary         ShowType = "SUMMARY"
-	ShowTypeShowFrom        ShowType = "SHOW_FROM"
-	ShowTypeShowUnqualified ShowType = "SHOW_UNQUALIFIED"
+	ShowTypeDescribe ShowType = "DESCRIBE"
+	ShowTypeSummary  ShowType = "SUMMARY"
+	// ShowTypeShow is `SHOW name`: a setting, falling back to describing
+	// a table of that name.
+	ShowTypeShow     ShowType = "SHOW"
+	ShowTypeShowFrom ShowType = "SHOW_FROM"
+	// ShowTypeShowSpecial is SHOW TABLES / DATABASES / SCHEMAS /
+	// VARIABLES and SHOW ALL TABLES.
+	ShowTypeShowSpecial ShowType = "SHOW_SPECIAL"
 )
 
 // ShowRef is the relation behind SHOW/DESCRIBE/SUMMARIZE. Port of
@@ -195,6 +204,9 @@ type ShowRef struct {
 	TableName   string `json:"table_name,omitempty"`
 	CatalogName string `json:"catalog_name,omitempty"`
 	SchemaName  string `json:"schema_name,omitempty"`
+	// Qualification is the full qualification path of a nested name
+	// (see BaseTableRef.Qualification).
+	Qualification []string `json:"qualification,omitempty"`
 	// Query is set when describing a query (`DESCRIBE SELECT ...`).
 	Query    QueryNode `json:"query,omitempty"`
 	ShowType ShowType  `json:"show_type"`

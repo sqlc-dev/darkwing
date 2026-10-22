@@ -59,7 +59,7 @@ func (tc *transformContext) transformWithClause(n tnode) ast.CTEMap {
 		name, cte := tc.transformWithStatement(ws, recursive)
 		key := strings.ToLower(name)
 		if seen[key] {
-			raise("Duplicate CTE name \"%s\"", name)
+			raise("Duplicate CTE name %s", quoteIdent(name))
 		}
 		seen[key] = true
 		out.Entries = append(out.Entries, ast.CTEMapEntry{Name: name, CTE: cte})
@@ -67,13 +67,14 @@ func (tc *transformContext) transformWithClause(n tnode) ast.CTEMap {
 	return out
 }
 
-// WithStatement <- ColIdOrString InsertColumnList? UsingKey? 'AS' Materialized? CTEBody
+// WithStatement <- ColIdOrString ColumnAliases? UsingKey? 'AS' Materialized? CTEBody
 func (tc *transformContext) transformWithStatement(n tnode, recursive bool) (string, *ast.CommonTableExpr) {
 	name := identifierText(n.child(0))
 	cte := &ast.CommonTableExpr{Materialized: ast.CTEMaterializeDefault}
 	cte.SetSpan(n.span())
 	if cols, ok := n.child(1).opt(); ok {
-		cte.Aliases = identifierList(cols.sole().parens())
+		// ColumnAliases <- Parens(List(ColIdOrString))
+		cte.Aliases = identifierList(cols.parens())
 	}
 	if uk, ok := n.child(2).opt(); ok {
 		// UsingKey <- 'USING' 'KEY' Parens(TargetList)
@@ -432,9 +433,6 @@ func (tc *transformContext) transformAliasedExpression(n tnode) ast.Expr {
 			expr.SetAlias(identifierText(id))
 		}
 		return expr
-	case "Expression":
-		// ExpressionAlias (expression statements) reuses this dispatch
-		return tc.transformExpression(alt)
 	}
 	shapeError(alt, "unknown aliased expression")
 	return nil
@@ -500,7 +498,8 @@ func normalizeSet(s ast.GroupingSet) ast.GroupingSet {
 	return out
 }
 
-// peekBareStar reports whether a GroupByExpression entry is a bare `*`.
+// peekBareStar reports whether a GroupByExpression entry is a bare `*`
+// (ExpressionIsEmptyStar: a qualified `t.*` counts too).
 func (tc *transformContext) peekBareStar(n tnode) (bool, bool) {
 	_, alt := n.sole().choice()
 	if alt.name() != "GroupByBaseExpression" {
@@ -508,7 +507,7 @@ func (tc *transformContext) peekBareStar(n tnode) (bool, bool) {
 	}
 	expr := tc.transformExpression(alt.sole())
 	star, ok := expr.(*ast.StarExpression)
-	if !ok || star.Columns || star.Expr != nil || star.RelationName != "" ||
+	if !ok || star.Columns || star.Expr != nil ||
 		len(star.ExcludeList) != 0 || len(star.ReplaceList) != 0 ||
 		len(star.QualifiedExcludeList) != 0 || len(star.RenameList) != 0 {
 		return false, false
@@ -693,7 +692,8 @@ func nullOrderOf(n tnode) ast.NullOrder {
 	return ast.NullsLast
 }
 
-// LimitOffset <- LimitOffsetClause / OffsetFetchClause / OffsetLimitClause / FetchOnlyClause
+// LimitOffset <- LimitOffsetClause / OffsetFetchClause / OffsetLimitClause /
+// FetchOffsetClause / FetchOnlyClause
 func (tc *transformContext) transformLimitOffset(n tnode) []ast.ResultModifier {
 	_, alt := n.sole().choice()
 	mod := &ast.LimitModifier{LimitType: ast.LimitRowCount}
@@ -712,6 +712,10 @@ func (tc *transformContext) transformLimitOffset(n tnode) []ast.ResultModifier {
 	case "OffsetFetchClause":
 		mod.Offset = tc.transformOffsetValue(alt.child(0))
 		mod.Limit = tc.transformFetchValue(alt.child(1))
+	case "FetchOffsetClause":
+		// FetchClause OffsetClause (v2.0)
+		mod.Limit = tc.transformFetchValue(alt.child(0))
+		mod.Offset = tc.transformOffsetValue(alt.child(1))
 	case "FetchOnlyClause":
 		mod.Limit = tc.transformFetchValue(alt.sole())
 	default:
@@ -729,7 +733,7 @@ func (tc *transformContext) applyLimitClause(mod *ast.LimitModifier, n tnode) {
 		// LIMIT ALL is an explicit NULL limit
 		mod.Limit = constExpr(invalidSpan, ast.Value{Type: ast.LogicalType{ID: "NULL"}, IsNull: true, Kind: ast.ValueNull})
 	case "LimitLiteralPercent":
-		mod.Limit = numberConstant(alt.child(0).span(), alt.child(0).number())
+		mod.Limit = numberConstant(invalidSpan, alt.child(0).number())
 		mod.LimitType = ast.LimitPercentage
 	case "LimitExpression":
 		// Expression '%'?
@@ -747,9 +751,16 @@ func (tc *transformContext) transformOffsetValue(n tnode) ast.Expr {
 	return tc.transformExpression(n.child(1).child(0))
 }
 
-// FetchClause <- 'FETCH' FirstOrNext FetchValue RowOrRows 'ONLY'
+// FetchClause <- FetchClauseWithoutValue / FetchClauseWithValue
+// FetchClauseWithValue <- 'FETCH' FirstOrNext FetchValue RowOrRows 'ONLY'
+// FetchClauseWithoutValue <- 'FETCH' FirstOrNext RowOrRows 'ONLY' fetches
+// one row (TransformFetchClauseWithoutValue: a location-free 1).
 func (tc *transformContext) transformFetchValue(n tnode) ast.Expr {
-	return tc.transformExpression(n.child(2).sole())
+	_, alt := n.sole().choice()
+	if alt.name() == "FetchClauseWithoutValue" {
+		return intConst(invalidSpan, 1)
+	}
+	return tc.transformExpression(alt.child(2).sole())
 }
 
 // ---- SHOW / DESCRIBE / SUMMARIZE --------------------------------------
@@ -764,75 +775,177 @@ var specialShowNames = map[string]bool{
 	"variables": true,
 }
 
-// DescribeStatement <- ShowTables / ShowSelect / ShowAllTables / ShowQualifiedName
-// All SHOW/DESCRIBE desugaring uses synthesized (location-free) nodes,
-// mirroring upstream.
+// DescribeStatement <- ShowTables / ShowDeprecatedSelect / DescribeSelect /
+// ShowAllTables / ShowByName / DescribeByName
+// Port of transformer/transform_describe.cpp. All SHOW/DESCRIBE
+// desugaring uses synthesized (location-free) nodes, mirroring upstream.
 func (tc *transformContext) transformDescribe(n tnode) ast.QueryNode {
 	_, alt := n.sole().choice()
-	ref := &ast.ShowRef{ShowType: ast.ShowTypeDescribe}
+	ref := &ast.ShowRef{}
 	ref.SetSpan(invalidSpan)
 	switch alt.name() {
-	case "ShowSelect":
-		if isSummarize(alt.child(0)) {
-			ref.ShowType = ast.ShowTypeSummary
-		}
+	case "ShowDeprecatedSelect":
+		// ShowRule SelectStatementInternal
+		ref.ShowType = ast.ShowTypeShow
+		ref.Query = tc.transformSelectInternal(alt.child(1))
+	case "DescribeSelect":
+		// DescribeOrSummarize SelectStatementInternal
+		ref.ShowType = describeOrSummarize(alt.child(0))
 		ref.Query = tc.transformSelectInternal(alt.child(1))
 	case "ShowAllTables":
-		ref.ShowType = ast.ShowTypeShowUnqualified
-		ref.TableName = "__show_tables_expanded"
-	case "ShowQualifiedName":
-		if isSummarize(alt.child(0)) {
-			ref.ShowType = ast.ShowTypeSummary
-		}
-		target, ok := alt.child(1).opt()
-		if !ok {
-			// bare SHOW expands like SHOW ALL TABLES
-			ref.ShowType = ast.ShowTypeShowUnqualified
-			ref.TableName = "__show_tables_expanded"
-			break
-		}
-		_, t := target.sole().choice()
-		switch t.name() {
-		case "DescribeBaseTableName":
-			btr := &ast.BaseTableRef{}
-			btr.SetSpan(invalidSpan)
-			tc.fillBaseTableName(btr, t.sole())
-			if btr.CatalogName == "" && btr.SchemaName == "" &&
-				ref.ShowType == ast.ShowTypeDescribe && specialShowNames[strings.ToLower(btr.TableName)] {
-				ref.ShowType = ast.ShowTypeShowUnqualified
-				ref.TableName = "\"" + strings.ToLower(btr.TableName) + "\""
-				break
-			}
-			// DESCRIBE/SUMMARIZE t wraps the relation as SELECT * FROM t
-			ref.Query = starSelect(btr, invalidSpan)
-		case "DescribeStringLiteral":
-			// DESCRIBE 'file.csv' wraps SELECT * FROM 'file.csv'
-			s, _ := t.sole().stringLit()
-			btr := &ast.BaseTableRef{TableName: s}
-			btr.SetSpan(invalidSpan)
-			ref.Query = starSelect(btr, invalidSpan)
-		}
+		setShowAllTables(ref)
+	case "ShowByName":
+		// ShowRule ShowTarget?
+		ref.ShowType = ast.ShowTypeShow
+		tc.buildShowByName(ref, alt.child(1))
+	case "DescribeByName":
+		// DescribeOrSummarize DescribeTarget?
+		ref.ShowType = describeOrSummarize(alt.child(0))
+		tc.buildDescribeByName(ref, alt.child(1))
 	case "ShowTables":
-		// 'SHOW' 'TABLES' 'FROM' QualifiedName
+		// ShowOrDescribe 'TABLES' 'FROM' QualifiedName
 		ref.ShowType = ast.ShowTypeShowFrom
 		cat, schema, name := tc.transformQualifiedNameParts(alt.child(3))
-		if cat == "" && schema == "" {
-			schema = name
-		} else if cat == "" {
-			cat, schema = schema, name
+		if cat != "" {
+			raise("Expected \"SHOW TABLES FROM database\", \"SHOW TABLES FROM schema\", or " +
+				"\"SHOW TABLES FROM database.schema\"")
 		}
-		ref.CatalogName, ref.SchemaName = cat, schema
+		if schema == "" {
+			ref.SchemaName = name
+		} else {
+			ref.CatalogName, ref.SchemaName = schema, name
+		}
 	default:
 		shapeError(alt, "unknown describe statement")
 	}
 	return starSelect(ref, invalidSpan)
 }
 
-// isSummarize reports whether a ShowOrDescribeOrSummarize (or
-// ShowOrDescribe) node spelled SUMMARIZE.
-func isSummarize(n tnode) bool {
-	_, alt := n.sole().choice()
-	return alt.name() == "Summarize"
+// describeOrSummarize maps DescribeOrSummarize <- DescribeRule / Summarize.
+func describeOrSummarize(n tnode) ast.ShowType {
+	if _, alt := n.sole().choice(); alt.name() == "Summarize" {
+		return ast.ShowTypeSummary
+	}
+	return ast.ShowTypeDescribe
+}
+
+// setShowAllTables configures the "list all tables" form (bare
+// SHOW/DESCRIBE and SHOW ALL TABLES).
+func setShowAllTables(ref *ast.ShowRef) {
+	ref.TableName = "__show_tables_expanded"
+	ref.ShowType = ast.ShowTypeShowSpecial
+}
+
+// describeTarget is upstream's DescribeTarget: a string-literal table
+// name, a relation, or nothing.
+type describeTarget struct {
+	isTableName bool
+	tableName   string
+	table       *ast.BaseTableRef
+}
+
+// transformDescribeTarget maps the target alternatives shared by
+// ShowTarget and DescribeTarget.
+func (tc *transformContext) transformDescribeTarget(alt tnode) describeTarget {
+	switch alt.name() {
+	case "DescribeBaseTableName", "ShowDeprecatedQualifiedTableName":
+		btr := &ast.BaseTableRef{}
+		btr.SetSpan(invalidSpan)
+		inner := alt.sole()
+		if inner.name() == "QualifiedTableName" {
+			// fillBaseTableName expects a BaseTableName-shaped choice
+			_, q := inner.sole().choice()
+			tc.fillQualifiedTable(btr, q)
+		} else {
+			tc.fillBaseTableName(btr, inner)
+		}
+		return describeTarget{table: btr}
+	case "ShowSettingName":
+		// a bare name: tried as a setting first, then as a table
+		btr := &ast.BaseTableRef{TableName: identifierText(alt)}
+		btr.SetSpan(invalidSpan)
+		return describeTarget{table: btr}
+	case "DescribeStringLiteral":
+		s := identifierText(alt)
+		if s == "" {
+			raise("Expected a table name, but got an empty string")
+		}
+		return describeTarget{isTableName: true, tableName: s}
+	case "ShowSpecialForm":
+		// keyword-only alternative: no target (autocomplete aid)
+		return describeTarget{}
+	}
+	shapeError(alt, "unknown describe target")
+	return describeTarget{}
+}
+
+// fillQualifiedTable fills a ref from a QualifiedTableName alternative
+// (CatalogReservedSchemaTable / SchemaReservedTable).
+func (tc *transformContext) fillQualifiedTable(ref *ast.BaseTableRef, alt tnode) {
+	tc.fillTableNameAlt(ref, alt)
+}
+
+// trySetSpecialShowForm ports TrySetSpecialShowForm: an unqualified
+// DATABASES/SCHEMAS/TABLES/VARIABLES target is a special form.
+func trySetSpecialShowForm(ref *ast.ShowRef, rel *ast.BaseTableRef) bool {
+	if rel.SchemaName != "" {
+		return false
+	}
+	name := strings.ToLower(rel.TableName)
+	if !specialShowNames[name] {
+		return false
+	}
+	ref.TableName = "\"" + name + "\""
+	ref.ShowType = ast.ShowTypeShowSpecial
+	return true
+}
+
+// buildShowByName ports BuildShowByName (SHOW is settings-first).
+func (tc *transformContext) buildShowByName(ref *ast.ShowRef, targetNode tnode) {
+	var target describeTarget
+	if t, ok := targetNode.opt(); ok {
+		_, alt := t.sole().choice()
+		target = tc.transformDescribeTarget(alt)
+	}
+	switch {
+	case !target.isTableName && target.table == nil:
+		// bare SHOW lists all tables
+		setShowAllTables(ref)
+	case target.isTableName:
+		ref.TableName = target.tableName
+	case trySetSpecialShowForm(ref, target.table):
+	case target.table.SchemaName != "":
+		// SHOW cat.tbl (deprecated) describes the table via a query
+		ref.CatalogName = target.table.CatalogName
+		ref.SchemaName = target.table.SchemaName
+		ref.TableName = target.table.TableName
+		ref.Qualification = target.table.Qualification
+		ref.Query = starSelect(target.table, invalidSpan)
+	default:
+		ref.TableName = target.table.TableName
+	}
+}
+
+// buildDescribeByName ports BuildDescribeByName (DESCRIBE/SUMMARIZE always
+// describe a relation or query).
+func (tc *transformContext) buildDescribeByName(ref *ast.ShowRef, targetNode tnode) {
+	var target describeTarget
+	if t, ok := targetNode.opt(); ok {
+		_, alt := t.sole().choice()
+		target = tc.transformDescribeTarget(alt)
+	}
+	switch {
+	case !target.isTableName && target.table == nil:
+		if ref.ShowType == ast.ShowTypeSummary {
+			raise("Expected table name with SUMMARIZE")
+		}
+		setShowAllTables(ref)
+	case target.isTableName:
+		ref.TableName = target.tableName
+	case trySetSpecialShowForm(ref, target.table):
+	default:
+		ref.Query = starSelect(target.table, invalidSpan)
+	}
 }
 
 // ---- samples -----------------------------------------------------------
@@ -938,44 +1051,6 @@ func formatSampleMethod(m string) ast.SampleMethod {
 	}
 	lower := strings.ToLower(m)
 	return ast.SampleMethod(strings.ToUpper(lower[:1]) + lower[1:])
-}
-
-// ExpressionStatement <- List(ExpressionAlias): a bare expression list is
-// a SELECT without a FROM clause.
-func init() {
-	register("ExpressionStatement", func(tc *transformContext, n tnode) ast.Stmt {
-		node := &ast.SelectNode{AggregateHandling: ast.StandardHandling}
-		node.SetSpan(n.span())
-		empty := &ast.EmptyTableRef{}
-		empty.SetSpan(invalidSpan)
-		node.FromTable = empty
-		for _, e := range n.sole().listElems() {
-			node.SelectList = append(node.SelectList, tc.transformAliasedExpression(e))
-		}
-		// a single bare column reference is a table query (`foo` is
-		// upstream's SELECT * FROM foo)
-		if len(node.SelectList) == 1 {
-			if ref, ok := node.SelectList[0].(*ast.ColumnRefExpression); ok && ref.GetAlias() == "" && len(ref.ColumnNames) <= 3 {
-				table := &ast.BaseTableRef{}
-				table.SetSpan(invalidSpan)
-				names := ref.ColumnNames
-				table.TableName = names[len(names)-1]
-				if len(names) >= 2 {
-					table.SchemaName = names[len(names)-2]
-				}
-				if len(names) == 3 {
-					table.CatalogName = names[0]
-				}
-				sel := starSelect(table, n.span())
-				stmt := &ast.SelectStatement{Node: sel}
-				stmt.SetSpan(n.span())
-				return stmt
-			}
-		}
-		stmt := &ast.SelectStatement{Node: node}
-		stmt.SetSpan(n.span())
-		return stmt
-	})
 }
 
 // normalizeKeyword upper-cases a keyword spelling for comparisons.

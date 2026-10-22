@@ -22,7 +22,6 @@ import (
 	"strings"
 
 	"github.com/sqlc-dev/darkwing/ast"
-	"github.com/sqlc-dev/darkwing/token"
 )
 
 func init() {
@@ -62,7 +61,7 @@ func init() {
 		return stmt
 	})
 	register("DeallocateStatement", func(tc *transformContext, n tnode) ast.Stmt {
-		// 'DEALLOCATE' DeallocatePrepare? Identifier
+		// 'DEALLOCATE' DeallocatePrepare? ColIdOrString
 		stmt := &ast.DeallocateStatement{Name: identifierText(n.child(2))}
 		stmt.SetSpan(n.span())
 		return stmt
@@ -114,6 +113,9 @@ func init() {
 	})
 	register("ExternalResourceStatement", func(tc *transformContext, n tnode) ast.Stmt {
 		return tc.transformExternalResource(n)
+	})
+	register("ExtensionRepositoryStatement", func(tc *transformContext, n tnode) ast.Stmt {
+		return tc.transformExtensionRepository(n)
 	})
 }
 
@@ -209,7 +211,17 @@ func (tc *transformContext) transformZoneValue(n tnode) ast.Expr {
 	case "ZoneStringLiteral", "ZoneIdentifier":
 		return constExpr(invalidSpan, varcharValue(identifierText(alt.sole())))
 	case "ZoneIntervalWithInterval":
-		// 'INTERVAL' StringLiteral Interval? -> CAST(str AS INTERVAL)
+		// 'INTERVAL' StringLiteral Interval? -> CAST(str AS INTERVAL);
+		// the Interval child still transforms, so a range specifier
+		// raises (UnsupportedIntervalRange)
+		if unitNode, ok := alt.child(2).opt(); ok {
+			if _, unit := unitNode.sole().choice(); unit.name() == "IntervalToInterval" {
+				_, r := unit.sole().choice()
+				if spec, known := intervalRangeSpecifiers[r.name()]; known {
+					raise("%s is not supported", spec)
+				}
+			}
+		}
 		return intervalCast(identifierText(alt.child(1)))
 	case "ZoneIntervalWithPrecision":
 		// 'INTERVAL' Parens(NumberLiteral) StringLiteral
@@ -318,7 +330,8 @@ func (tc *transformContext) transformUse(n tnode) ast.Stmt {
 	_, alt := n.child(1).sole().choice()
 	switch alt.name() {
 	case "SchemaNameAsUseTarget", "CatalogNameAsUseTarget":
-		stmt.Name = identifierText(alt.sole())
+		// SchemaName / StringLiteral
+		stmt.Name = identifierText(alt)
 	case "UseTargetCatalogSchema":
 		// CatalogName '.' ReservedSchemaName DotIdentifier*
 		if len(alt.child(3).repeat()) > 0 {
@@ -389,8 +402,10 @@ func (tc *transformContext) transformAnalyzeTarget(n tnode) (ast.TableRef, []str
 }
 
 // VacuumStatement <- 'VACUUM' VacuumOptions? AnalyzeTarget?
-// FULL/FREEZE/VERBOSE and unknown parenthesized options raise
-// NotImplemented upstream (post-parse); darkwing records the raw options.
+// FULL/FREEZE/VERBOSE/DISABLE_PAGE_SKIPPING raise NotImplemented upstream
+// (post-parse); darkwing records the raw options. In the parenthesized
+// form, the first option that is none of those nor ANALYZE is a parse
+// error (TransformVacuumParensOptions).
 func (tc *transformContext) transformVacuum(n tnode) ast.Stmt {
 	stmt := &ast.VacuumStatement{}
 	stmt.SetSpan(n.span())
@@ -415,9 +430,16 @@ func (tc *transformContext) transformVacuum(n tnode) ast.Stmt {
 					name = identifierText(opt)
 				}
 				stmt.Options = append(stmt.Options, name)
-				if strings.EqualFold(name, "analyze") {
-					stmt.Analyze = true
+			}
+			for _, name := range stmt.Options {
+				lower := strings.ToLower(name)
+				if lower == "disable_page_skipping" || lower == "freeze" || lower == "full" || lower == "verbose" {
+					break
 				}
+				if lower != "analyze" {
+					raise("unrecognized VACUUM option \"%s\"", name)
+				}
+				stmt.Analyze = true
 			}
 		case "VacuumLegacyOptions":
 			// OptFull? OptFreeze? OptVerbose? OptAnalyze?
@@ -549,7 +571,7 @@ func preparableStatement(stmt ast.Stmt) bool {
 	return false
 }
 
-// PrepareStatement <- 'PREPARE' Identifier TypeList? 'AS' Statement
+// PrepareStatement <- 'PREPARE' ColIdOrString TypeList? 'AS' Statement
 // A TypeList raises NotImplemented upstream (post-parse); darkwing
 // ignores it. The inner statement's parameters belong to EXECUTE, so the
 // collected parameter state is cleared, mirroring upstream's
@@ -569,7 +591,7 @@ func (tc *transformContext) transformPrepare(n tnode) ast.Stmt {
 	return stmt
 }
 
-// ExecuteStatement <- 'EXECUTE' Identifier TableFunctionArguments?
+// ExecuteStatement <- 'EXECUTE' ColIdOrString TableFunctionArguments?
 // Non-scalar and mixed named/positional arguments raise
 // InvalidInput/NotImplemented upstream (post-parse); darkwing records
 // the arguments as written.
@@ -599,12 +621,15 @@ func (tc *transformContext) transformExecute(n tnode) ast.Stmt {
 // ---- EXPLAIN -----------------------------------------------------------
 
 // ExplainStatement <- 'EXPLAIN' AnalyzeKeyword? ExplainOptionList? ExplainableStatements
-// Unknown options and malformed FORMAT arguments raise
-// NotImplemented/InvalidInput upstream (post-parse); darkwing records
-// what it recognizes and accepts.
+// Unknown options, malformed FORMAT/SQL arguments and SQL combined with
+// ANALYZE or FORMAT raise NotImplemented/InvalidInput upstream
+// (post-parse); darkwing records what it recognizes and accepts. The one
+// Parser Error is PivotEntryCheck for EXPLAIN (SQL), which runs after the
+// explained statement is transformed.
 func (tc *transformContext) transformExplain(n tnode) ast.Stmt {
 	stmt := &ast.ExplainStatement{Type: ast.ExplainStandard}
 	stmt.SetSpan(n.span())
+	sqlIsSet := false
 	if _, ok := n.child(1).opt(); ok {
 		stmt.Type = ast.ExplainAnalyze
 	}
@@ -624,6 +649,8 @@ func (tc *transformContext) transformExplain(n tnode) ast.Stmt {
 				}
 			case "analyze":
 				stmt.Type = ast.ExplainAnalyze
+			case "sql":
+				sqlIsSet = true
 			}
 		}
 	}
@@ -637,6 +664,10 @@ func (tc *transformContext) transformExplain(n tnode) ast.Stmt {
 	} else {
 		shapeError(inner, "unknown explainable statement")
 	}
+	if sqlIsSet {
+		tc.pivotEntryCheck("EXPLAIN (SQL) statement")
+		stmt.Type = ast.ExplainSQL
+	}
 	return stmt
 }
 
@@ -647,7 +678,7 @@ func (tc *transformContext) transformExplain(n tnode) ast.Stmt {
 func checkSingleValuedOptions(opts []ast.GenericOption) {
 	for _, o := range opts {
 		if o.Expr == nil && len(o.Values) > 1 {
-			raise("Option %s can only have one argument", o.Name)
+			raise("Option %s can only have one argument", quotedIdent(o.Name))
 		}
 	}
 }
@@ -723,7 +754,9 @@ var commentOnTypes = map[string]ast.CommentOnType{
 	"CommentColumn":     ast.CommentOnColumn,
 }
 
-// CommentStatement <- 'COMMENT' 'ON' CommentOnType DottedIdentifier 'IS' CommentValue
+// CommentStatement <- 'COMMENT' 'ON' CommentOnType CommentTarget 'IS' CommentValue
+// CommentTarget <- DottedIdentifier / CommentStringLiteralIdentifier
+// (a string target is a single-component name).
 // Upstream desugars into ALTER with a comment info; COMMENT ON
 // DATABASE/SCHEMA raise NotImplemented upstream (post-parse).
 func (tc *transformContext) transformComment(n tnode) ast.Stmt {
@@ -735,12 +768,17 @@ func (tc *transformContext) transformComment(n tnode) ast.Stmt {
 		shapeError(kind, "unknown comment target")
 	}
 	stmt.OnType = onType
-	parts := dottedIdentifier(n.child(3))
+	var parts []string
+	if _, target := n.child(3).sole().choice(); target.name() == "DottedIdentifier" {
+		parts = dottedIdentifier(target)
+	} else {
+		parts = []string{identifierText(target)}
+	}
 	if onType == ast.CommentOnColumn {
 		stmt.Column = parts[len(parts)-1]
 		parts = parts[:len(parts)-1]
 		if len(parts) == 0 {
-			raise("Invalid column reference: '%s'", stmt.Column)
+			raise("Invalid column reference: %s", sqlIdentifier(stmt.Column))
 		}
 	}
 	stmt.Catalog, stmt.Schema, stmt.Name = qualifiedNameFromParts(parts)
@@ -752,28 +790,6 @@ func (tc *transformContext) transformComment(n tnode) ast.Stmt {
 		stmt.Value = constExpr(invalidSpan, varcharValue(identifierText(value)))
 	}
 	return stmt
-}
-
-// optionallyQuoted renders an identifier for an error message the way
-// upstream's KeywordHelper::WriteOptionallyQuoted does: wrapped in double
-// quotes (embedded quotes doubled) when it is empty, is a keyword, or is
-// not a plain lowercase identifier.
-func optionallyQuoted(s string) string {
-	needs := s == "" || token.IsKeyword(s)
-	for i := 0; i < len(s) && !needs; i++ {
-		c := s[i]
-		switch {
-		case c >= 'a' && c <= 'z' || c == '_':
-		case c >= '0' && c <= '9':
-			needs = i == 0
-		default:
-			needs = true
-		}
-	}
-	if !needs {
-		return s
-	}
-	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
 }
 
 // qualifiedNameFromParts splits a dotted path into catalog/schema/name,
@@ -793,11 +809,14 @@ func qualifiedNameFromParts(parts []string) (catalog, schema, name string) {
 
 // ---- extensions --------------------------------------------------------
 
-// LoadStatement <- 'LOAD' ColIdOrString ExtensionAlias?
+// LoadStatement <- 'LOAD' ColIdOrString FromSource? ExtensionAlias?
 func (tc *transformContext) transformLoad(n tnode) ast.Stmt {
 	stmt := &ast.LoadStatement{Kind: ast.LoadTypeLoad, Name: identifierText(n.child(1))}
 	stmt.SetSpan(n.span())
-	if alias, ok := n.child(2).opt(); ok {
+	if src, ok := n.child(2).opt(); ok {
+		stmt.Repository, stmt.RepoIsAlias = fromSource(src)
+	}
+	if alias, ok := n.child(3).opt(); ok {
 		// ExtensionAlias <- 'AS' Identifier
 		stmt.Kind = ast.LoadTypeLoadAs
 		stmt.Alias = identifierText(alias.child(1))
@@ -805,68 +824,194 @@ func (tc *transformContext) transformLoad(n tnode) ast.Stmt {
 	return stmt
 }
 
-// InstallStatement <- 'FORCE'? 'INSTALL' IdentifierOrStringLiteral FromSource? VersionNumber?
+// fromSource maps FromSource <- FromSourceIdentifier / FromSourceString.
+func fromSource(n tnode) (string, bool) {
+	_, alt := n.sole().choice()
+	return identifierText(alt.child(1)), alt.name() == "FromSourceIdentifier"
+}
+
+// InstallStatement <- 'FORCE'? 'INSTALL' InstallAndLoad?
+// IdentifierOrStringLiteral FromSource? VersionNumber?
 func (tc *transformContext) transformInstall(n tnode) ast.Stmt {
 	stmt := &ast.LoadStatement{Kind: ast.LoadTypeInstall}
 	stmt.SetSpan(n.span())
 	if _, force := n.child(0).opt(); force {
 		stmt.Kind = ast.LoadTypeForceInstall
 	}
-	stmt.Name = identifierText(n.child(2))
-	if src, ok := n.child(3).opt(); ok {
-		// FromSource <- FromSourceIdentifier / FromSourceString
-		_, alt := src.sole().choice()
-		stmt.Repository = identifierText(alt.child(1))
-		stmt.RepoIsAlias = alt.name() == "FromSourceIdentifier"
+	// InstallAndLoad <- 'AND' 'LOAD'
+	stmt.LoadAfterInstall = optMatched(n.child(2))
+	stmt.Name = identifierText(n.child(3))
+	if src, ok := n.child(4).opt(); ok {
+		stmt.Repository, stmt.RepoIsAlias = fromSource(src)
 	}
-	if ver, ok := n.child(4).opt(); ok {
+	if ver, ok := n.child(5).opt(); ok {
 		// VersionNumber <- 'VERSION' IdentifierOrStringLiteral
 		stmt.Version = identifierText(ver.child(1))
 	}
 	return stmt
 }
 
-// ExternalResourceStatement <- CreateExternalResourceStmt /
-// RegisterExternalResourceStmt / DestroyExternalResourceStmt / ShowExternalResourcesStmt
-func (tc *transformContext) transformExternalResource(n tnode) ast.Stmt {
-	stmt := &ast.ExternalResourceStatement{}
+// ExtensionRepositoryStatement <- CreateExtensionRepositoryStmt /
+// DropExtensionRepositoryStmt. Port of
+// TransformCreateExtensionRepositoryStmt / TransformDropExtensionRepositoryStmt
+// (both produce a LoadStatement upstream).
+func (tc *transformContext) transformExtensionRepository(n tnode) ast.Stmt {
+	stmt := &ast.LoadStatement{}
 	stmt.SetSpan(n.span())
 	_, alt := n.sole().choice()
 	switch alt.name() {
+	case "CreateExtensionRepositoryStmt":
+		// 'CREATE' OrReplace? 'EXTENSION' 'REPOSITORY' IfNotExists?
+		// ColIdOrString RepositoryPrefix RepositoryPublicKey?
+		stmt.Kind = ast.LoadTypeCreateRepository
+		stmt.Repository = identifierText(alt.child(5))
+		// RepositoryPrefix <- 'WITH'? 'PREFIX' StringLiteral
+		stmt.RepositoryURL = identifierText(alt.child(6).child(2))
+		if keys, ok := alt.child(7).opt(); ok {
+			// RepositoryPublicKey <- 'USING'? 'PUBLIC' ('KEYS' / 'KEY') List(StringLiteral)
+			stmt.PublicKeys = identifierList(keys.child(3))
+		}
+		orReplace, ifNotExists := optMatched(alt.child(1)), optMatched(alt.child(4))
+		if orReplace && ifNotExists {
+			raise("Cannot combine OR REPLACE with IF NOT EXISTS")
+		}
+		switch {
+		case orReplace:
+			stmt.OnConflict = ast.CreateReplace
+		case ifNotExists:
+			stmt.OnConflict = ast.CreateIgnore
+		}
+	case "DropExtensionRepositoryStmt":
+		// 'DROP' 'EXTENSION' 'REPOSITORY' IfExists? ColIdOrString
+		stmt.Kind = ast.LoadTypeDropRepository
+		stmt.MissingOK = optMatched(alt.child(3))
+		stmt.Repository = identifierText(alt.child(4))
+	default:
+		shapeError(alt, "unknown extension repository statement")
+	}
+	return stmt
+}
+
+// ExternalResourceStatement <- CreateExternalResourceStmt /
+// RegisterExternalResourceStmt / DestroyExternalResourceStmt /
+// ShowExternalResourcesStmt / AttachToExternalResource /
+// ConnectToExternalResource
+// (ExternalResourceKeyword <- 'EXTERNAL' 'RESOURCE')
+func (tc *transformContext) transformExternalResource(n tnode) ast.Stmt {
+	_, alt := n.sole().choice()
+	switch alt.name() {
+	case "AttachToExternalResource":
+		return tc.transformAttachToExternalResource(alt)
+	case "ConnectToExternalResource":
+		return tc.transformConnectToExternalResource(alt)
+	}
+	stmt := &ast.ExternalResourceStatement{}
+	stmt.SetSpan(n.span())
+	switch alt.name() {
 	case "CreateExternalResourceStmt":
-		// 'CREATE' 'EXTERNAL' 'RESOURCE' StringLiteral AttachAlias? ExternalResourceCreationOptions?
+		// 'CREATE' ExternalResourceKeyword StringLiteral AttachAlias? ExternalResourceCreationOptions?
 		stmt.Operation = ast.ExternalResourceCreate
-		stmt.Type = identifierText(alt.child(3))
-		if alias, ok := alt.child(4).opt(); ok {
+		stmt.Type = identifierText(alt.child(2))
+		if alias, ok := alt.child(3).opt(); ok {
 			stmt.Name = identifierText(alias.child(1))
 		}
-		if opts, ok := alt.child(5).opt(); ok {
-			// a bare flag binds to boolean true, mirroring upstream
-			for _, o := range tc.transformGenericOptionList(opts.sole()) {
-				if o.Expr == nil && len(o.Values) == 0 {
-					o.Values = []ast.Value{{Type: ast.LogicalType{ID: "BOOLEAN"}, Kind: ast.ValueBool, Bool: true}}
-				}
-				stmt.Options = append(stmt.Options, o)
-			}
+		if opts, ok := alt.child(4).opt(); ok {
+			stmt.Options = tc.collectGenericOptions(opts)
 		}
 	case "RegisterExternalResourceStmt":
-		// 'REGISTER' 'EXTERNAL' 'RESOURCE' StringLiteral AttachAlias? 'FROM' Expression
+		// 'REGISTER' ExternalResourceKeyword StringLiteral AttachAlias? 'FROM' Expression
 		stmt.Operation = ast.ExternalResourceRegister
-		stmt.Type = identifierText(alt.child(3))
-		if alias, ok := alt.child(4).opt(); ok {
+		stmt.Type = identifierText(alt.child(2))
+		if alias, ok := alt.child(3).opt(); ok {
 			stmt.Name = identifierText(alias.child(1))
 		}
-		stmt.Handle = tc.transformExpression(alt.child(6))
+		stmt.Handle = tc.transformExpression(alt.child(5))
 	case "DestroyExternalResourceStmt":
-		// 'DESTROY' 'EXTERNAL' 'RESOURCE' ColId
+		// 'DESTROY' ExternalResourceKeyword ColId
 		stmt.Operation = ast.ExternalResourceDestroy
-		stmt.Name = identifierText(alt.child(3))
+		stmt.Name = identifierText(alt.child(2))
 	case "ShowExternalResourcesStmt":
 		// 'SHOW' ShowAllModifier? 'EXTERNAL' 'RESOURCES'
 		stmt.Operation = ast.ExternalResourceShow
 		_, stmt.All = alt.child(1).opt()
 	default:
 		shapeError(alt, "unknown external resource statement")
+	}
+	return stmt
+}
+
+// collectGenericOptions ports CollectGenericOptions over
+// ExternalResourceCreationOptions (GenericCopyOptionList): a bare flag
+// binds to boolean true, an option carries at most one argument (a NULL
+// argument raises a BinderException upstream: post-parse).
+func (tc *transformContext) collectGenericOptions(n tnode) []ast.GenericOption {
+	var out []ast.GenericOption
+	for _, o := range tc.transformGenericOptionList(n.sole()) {
+		if o.Expr == nil {
+			switch {
+			case len(o.Values) == 0:
+				o.Values = []ast.Value{boolValue(true)}
+			case len(o.Values) > 1:
+				raise("Option %s can only have one argument", quotedIdent(o.Name))
+			}
+		}
+		out = append(out, o)
+	}
+	return out
+}
+
+// transformExternalResourceSource maps ExternalResourceSource <-
+// ExternalResourceCreateClause / ExternalResourceReferenceClause.
+func (tc *transformContext) transformExternalResourceSource(n tnode) *ast.ExternalResourceSource {
+	src := &ast.ExternalResourceSource{}
+	_, alt := n.sole().choice()
+	switch alt.name() {
+	case "ExternalResourceCreateClause":
+		// 'NEW' 'TEMPORARY' ExternalResourceKeyword StringLiteral ExternalResourceCreationOptions?
+		src.Provider = identifierText(alt.child(3))
+		if opts, ok := alt.child(4).opt(); ok {
+			src.Params = tc.collectGenericOptions(opts)
+		}
+	case "ExternalResourceReferenceClause":
+		// ExternalResourceKeyword ColId
+		src.ReferenceName = identifierText(alt.child(1))
+	default:
+		shapeError(alt, "unknown external resource source")
+	}
+	return src
+}
+
+// AttachToExternalResource <- 'ATTACH' 'TO' ExternalResourceSource
+// AttachAlias AttachOptions?
+// Port of TransformAttachToExternalResource.
+func (tc *transformContext) transformAttachToExternalResource(n tnode) ast.Stmt {
+	stmt := &ast.AttachStatement{OnConflict: ast.CreateError}
+	stmt.SetSpan(n.span())
+	stmt.ExternalResource = tc.transformExternalResourceSource(n.child(2))
+	stmt.Alias = identifierText(n.child(3).child(1))
+	if opts, ok := n.child(4).opt(); ok {
+		stmt.Options = tc.transformGenericOptionList(opts.sole())
+		checkSingleValuedOptions(stmt.Options)
+	}
+	return stmt
+}
+
+// ConnectToExternalResource <- 'CONNECT' 'TO' ExternalResourceSource AttachOptions?
+// Port of TransformConnectToExternalResource: provisioning claims the
+// create params, so the connection cannot take an option list of its own.
+func (tc *transformContext) transformConnectToExternalResource(n tnode) ast.Stmt {
+	stmt := &ast.ConnectStatement{}
+	stmt.SetSpan(n.span())
+	stmt.ExternalResource = tc.transformExternalResourceSource(n.child(2))
+	if opts, ok := n.child(3).opt(); ok {
+		options := tc.transformGenericOptionList(opts.sole())
+		if stmt.ExternalResource.ReferenceName == "" {
+			raise("CONNECT TO NEW TEMPORARY EXTERNAL RESOURCE: the option list belongs to the resource, so " +
+				"the connection cannot take one of its own. Use `ATTACH TO NEW TEMPORARY EXTERNAL " +
+				"RESOURCE ... AS <name> (options); CONNECT <name>;` instead")
+		}
+		checkSingleValuedOptions(options)
+		stmt.Options = options
 	}
 	return stmt
 }

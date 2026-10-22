@@ -7,7 +7,7 @@ in `internal/grammar/README.md`.
 
 ## Layout
 
-- `token/` — token kinds, `Token{Kind, Text, Span}`, the five keyword
+- `token/` — token kinds, `Token{Kind, Text, Span}`, the six keyword
   categories (built from the vendored `.list` files).
 - `lexer/` — port of `base_tokenizer.cpp` + `parser_tokenizer.cpp`.
 - `internal/grammar/` — vendored `.gram`/`.list` files (never edit them by
@@ -46,10 +46,14 @@ in `internal/grammar/README.md`.
 
 - **Effective behavior over textbook behavior.** darkwing replicates what the
   pinned DuckDB build actually does, including acknowledged quirks: negative
-  lookahead (`!`) is parsed but ignored by the matcher; `/` binds only the
-  immediately preceding element (upstream grammars parenthesize sequences in
-  alternatives); `*`/`+`/`?` wrap only the last element of the current list.
-  Do not "fix" these — they are pinned by tests.
+  lookahead (`!`) is parsed but ignored by the matcher. Do not "fix" these —
+  they are pinned by tests. (Since v2.0.0 the grammar parser uses ordinary
+  PEG precedence — postfix, then sequence, then `/` — so the earlier
+  "`/` binds one element" quirk is gone.)
+- **The oracle is the library parser.** The pinned CLI is run with
+  `SET active_grammar_extensions=[]` (its `shell` extension re-adds bare
+  expression statements) and `DUCKDB_AGENT_MODE=0`; see
+  `internal/duckdbsrc`.
 - **Vendored files are verbatim.** `internal/grammar/duckdb/**` is copied
   unmodified from upstream. Changing grammar behavior means advancing the pin,
   never editing the files.
@@ -109,7 +113,7 @@ DARKWING_DUCKDB=/path/to/duckdb-cli go run ./cmd/serialize-diff -corpus
 ```
 
 Regenerating the corpus (needs a DuckDB checkout at the pinned commit and
-the matching nightly CLI; see `internal/grammar/README.md` for the pin):
+the matching release CLI; see `internal/grammar/README.md` for the pin):
 
 ```
 DARKWING_DUCKDB=/path/to/duckdb-cli \

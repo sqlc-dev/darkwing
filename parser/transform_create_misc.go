@@ -42,7 +42,7 @@ func (tc *transformContext) transformMacroDefinition(n tnode) *ast.MacroFunction
 			mp := tc.transformMacroParameter(p)
 			key := strings.ToLower(mp.Name)
 			if seen[key] {
-				raise("Duplicate parameter '%s' in macro definition", mp.Name)
+				raise("Duplicate parameter %s in macro definition", quotedIdent(mp.Name))
 			}
 			seen[key] = true
 			if mp.Default != nil {

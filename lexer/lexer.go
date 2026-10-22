@@ -8,7 +8,6 @@ package lexer
 
 import (
 	"fmt"
-	"strings"
 
 	"github.com/sqlc-dev/darkwing/token"
 )
@@ -128,7 +127,7 @@ func charIsOperatorAny(c byte) bool {
 
 func isSingleByteOperator(c byte) bool {
 	switch c {
-	case '(', ')', '{', '}', '[', ']', ',', '?', '$', '-', '#':
+	case '(', ')', '{', '}', '[', ']', ',', ':', '?', '$', '#':
 		return true
 	default:
 		return false
@@ -157,7 +156,7 @@ func charIsScientific(c byte) bool {
 
 func charIsControlFlow(c byte) bool {
 	switch c {
-	case '\'', '-', ';', '"', '.':
+	case '\'', ';', '"', '.':
 		return true
 	default:
 		return false
@@ -181,15 +180,22 @@ func charIsKeyword(c byte) bool {
 }
 
 // charIsOperatorCont reports whether c may continue a multi-character
-// operator token (Tokenizer::CharacterIsOperator).
+// operator token (Tokenizer::CharacterIsOperator): the fixed set of
+// PostgreSQL operator characters, narrower than charIsOperatorAny.
 func charIsOperatorCont(c byte) bool {
-	if isSingleByteOperator(c) {
+	switch c {
+	case '+', '-', '*', '/', '%', '^', '<', '>', '=', '~', '!', '@', '&', '|':
+		return true
+	default:
 		return false
 	}
-	if charIsControlFlow(c) {
-		return false
-	}
-	return charIsOperatorAny(c)
+}
+
+// isQuotedIdentifierDelimiter is Tokenizer::IsQuotedIdentifierDelimiter:
+// double quotes are the SQL standard delimiter; backticks are accepted as
+// an alternative, with the same doubling rule for escaping the delimiter.
+func isQuotedIdentifierDelimiter(c byte) bool {
+	return c == '"' || c == '`'
 }
 
 func charIsSpecialStringPrefix(c byte) bool {
@@ -220,26 +226,24 @@ func isValidDollarTagChar(c byte) bool {
 	return c >= 0x80
 }
 
-// specialOperator reports whether a multi-character special operator starts
-// at sql[pos] and returns its length (Tokenizer::IsSpecialOperator).
-func specialOperator(sql string, pos int) (int, bool) {
-	if pos+2 < len(sql) && sql[pos:pos+3] == "->>" {
-		return 3, true
+// compoundColonToken reports whether "::" or ":=" starts at sql[pos]
+// (Tokenizer::IsCompoundColonToken). Every other multi-character operator
+// is assembled by the operator state.
+func compoundColonToken(sql string, pos int) bool {
+	if pos+1 >= len(sql) || sql[pos] != ':' {
+		return false
 	}
-	if pos+1 >= len(sql) {
-		// 2-byte operators are out-of-bounds
-		return 0, false
-	}
-	switch sql[pos : pos+2] {
-	case "::", ":=", "->", "**", "//":
-		return 2, true
-	}
-	return 0, false
+	return sql[pos+1] == ':' || sql[pos+1] == '='
 }
 
 type lexer struct {
 	sql    string
 	tokens []token.Token
+	// hasBlockComment and lastBlockCommentPos track the most recent block
+	// comment (TokenizerBehavior::has_block_comment /
+	// last_block_comment_position), for Token.PrecededByBlockComment.
+	hasBlockComment     bool
+	lastBlockCommentPos int
 }
 
 func (l *lexer) push(kind token.Kind, text string, offset int) {
@@ -251,13 +255,26 @@ func (l *lexer) push(kind token.Kind, text string, offset int) {
 }
 
 // pushRange is TokenizerBehavior::PushToken with the parser behavior's
-// zero-length delimited identifier check: comments and empty ranges are
-// dropped.
+// checks (ParserTokenizerBehavior::PushToken): an unterminated block
+// comment and a zero-length delimited identifier are errors; comments and
+// empty ranges are dropped. Only tokens pushed here get the
+// PrecededByNewline / PrecededByBlockComment flags - upstream appends the
+// single-byte operators, terminators, parameters and the final token
+// directly, bypassing PushToken.
 func (l *lexer) pushRange(start, end int, kind token.Kind, unterminated bool) error {
-	if kind == token.Identifier && end == start+2 && l.sql[start:end] == `""` {
-		return &Error{Msg: "zero-length delimited identifier", Offset: start}
+	if kind == token.Comment && unterminated {
+		return &Error{Msg: `unterminated /* comment at or near "` + l.sql[start:end] + `"`, Offset: start}
+	}
+	if kind == token.Identifier && end == start+2 {
+		if q := l.sql[start:end]; q == `""` || q == "``" {
+			return &Error{Msg: "zero-length delimited identifier", Offset: start}
+		}
 	}
 	if kind == token.Comment {
+		if end >= start+2 && l.sql[start] == '/' && l.sql[start+1] == '*' {
+			l.hasBlockComment = true
+			l.lastBlockCommentPos = start
+		}
 		return nil
 	}
 	if start >= end {
@@ -269,6 +286,54 @@ func (l *lexer) pushRange(start, end int, kind token.Kind, unterminated bool) er
 		Span:         token.Span{Start: start, End: end},
 		Unterminated: unterminated,
 	})
+	if len(l.tokens) < 2 {
+		return nil
+	}
+	cur := &l.tokens[len(l.tokens)-1]
+	prev := l.tokens[len(l.tokens)-2]
+	// upstream measures the previous token as offset + text length, which
+	// is not always its source extent (see push)
+	prevEnd := prev.Span.Start + len(prev.Text)
+	if l.hasBlockComment && l.lastBlockCommentPos >= prevEnd && l.lastBlockCommentPos < start {
+		cur.PrecededByBlockComment = true
+	}
+	for pos := prevEnd; pos < start; pos++ {
+		if l.sql[pos] == '\n' || l.sql[pos] == '\r' {
+			cur.PrecededByNewline = true
+			break
+		}
+	}
+	return nil
+}
+
+// pushOperator is Tokenizer::PushOperatorToken, applying the PostgreSQL
+// trimming rule: an operator cannot end in '+' or '-' unless it contains
+// at least one of ~ ! @ # % ^ & | ` ?. The trimmed characters become
+// individual tokens (appended directly, as upstream does).
+func (l *lexer) pushOperator(start, end int) error {
+	sql := l.sql
+	endPos := end
+	hasSpecial := false
+	for pos := start; pos < endPos; pos++ {
+		switch sql[pos] {
+		case '~', '!', '@', '#', '%', '^', '&', '|', '`', '?':
+			hasSpecial = true
+		}
+		if hasSpecial {
+			break
+		}
+	}
+	if !hasSpecial {
+		for endPos > start+1 && (sql[endPos-1] == '+' || sql[endPos-1] == '-') {
+			endPos--
+		}
+	}
+	if err := l.pushRange(start, endPos, token.Operator, false); err != nil {
+		return err
+	}
+	for pos := endPos; pos < end; pos++ {
+		l.push(token.Operator, string(sql[pos]), pos)
+	}
 	return nil
 }
 
@@ -277,7 +342,8 @@ func (l *lexer) pushRange(start, end int, kind token.Kind, unterminated bool) er
 // are determined by the grammar, not the tokenizer); an EndOfInput sentinel
 // is always appended. Errors carry byte offsets and match the conditions
 // upstream's parser tokenizer raises: unterminated string literals,
-// unterminated quoted identifiers, and zero-length delimited identifiers.
+// unterminated quoted identifiers, unterminated block comments, and
+// zero-length delimited identifiers.
 func Tokenize(sql string) ([]token.Token, error) {
 	l := &lexer{sql: sql}
 	if err := l.run(); err != nil {
@@ -293,6 +359,7 @@ func (l *lexer) run() error {
 	state := stateStandard
 	lastPos := 0
 	escapeString := false
+	quotedIdentifierDelimiter := byte('"')
 	dollarQuoteMarker := ""
 	dollarMarkerStart := 0
 	multiLineCommentDepth := 0
@@ -307,8 +374,9 @@ func (l *lexer) run() error {
 				escapeString = false
 				break
 			}
-			if c == '"' {
+			if isQuotedIdentifierDelimiter(c) {
 				state = stateQuotedIdentifier
+				quotedIdentifierDelimiter = c
 				lastPos = i
 				break
 			}
@@ -330,6 +398,8 @@ func (l *lexer) run() error {
 					l.push(token.Operator, "$", i)
 					break
 				}
+				// dollar-quoted string or collabel parameter ($collabel)
+				lastPos = i
 				// scan until next $
 				nextDollar := 0
 				for idx := i + 1; idx < n; idx++ {
@@ -374,11 +444,18 @@ func (l *lexer) run() error {
 				lastPos = i + 1
 				break
 			}
-			if opLen, ok := specialOperator(sql, i); ok {
-				// special operator - pushed with lastPos as its offset,
+			if compoundColonToken(sql, i) {
+				if i+2 < n && charIsOperatorCont(sql[i+2]) {
+					// "::" or ":=" followed by an operator character is
+					// left to the operator state
+					state = stateOperator
+					lastPos = i
+					break
+				}
+				// compound colon token - pushed with lastPos as its offset,
 				// exactly as upstream does
-				l.push(token.Operator, sql[i:i+opLen], lastPos)
-				i += opLen - 1
+				l.push(token.Operator, sql[i:i+2], lastPos)
+				i++
 				lastPos = i + 1
 				break
 			}
@@ -417,8 +494,8 @@ func (l *lexer) run() error {
 			if charIsInitialNumber(c) {
 				break
 			}
-			// underscore only when immediately followed by a digit
-			if c == '_' && i+1 < n && charIsInitialNumber(sql[i+1]) {
+			// a digit separator must sit between two digits
+			if c == '_' && charIsDigit(sql[i-1]) && i+1 < n && charIsDigit(sql[i+1]) {
 				break
 			}
 			// scientific notation marker
@@ -444,31 +521,12 @@ func (l *lexer) run() error {
 			i--
 
 		case stateOperator:
-			if !charIsOperatorCont(c) {
-				// PostgreSQL trimming rule: an operator cannot end in '+'
-				// unless it contains at least one of: ~ ! @ # % ^ & | ` ?
-				endPos := i
-				hasSpecial := false
-				for j := lastPos; j < endPos; j++ {
-					switch sql[j] {
-					case '~', '!', '@', '#', '%', '^', '&', '|', '`', '?':
-						hasSpecial = true
-					}
-					if hasSpecial {
-						break
-					}
-				}
-				if !hasSpecial {
-					for endPos > lastPos && sql[endPos-1] == '+' {
-						endPos--
-					}
-				}
-				if err := l.pushRange(lastPos, endPos, token.Operator, false); err != nil {
+			// a comment start ends the operator; back in the standard
+			// state it is tokenized as a comment
+			if (c == '-' && i+1 < n && sql[i+1] == '-') || (c == '/' && i+1 < n && sql[i+1] == '*') ||
+				!charIsOperatorCont(c) {
+				if err := l.pushOperator(lastPos, i); err != nil {
 					return err
-				}
-				// push any trimmed '+' characters as individual tokens
-				for j := endPos; j < i; j++ {
-					l.push(token.Operator, string(sql[j]), j)
 				}
 				state = stateStandard
 				lastPos = i
@@ -511,8 +569,8 @@ func (l *lexer) run() error {
 			}
 
 		case stateQuotedIdentifier:
-			if c == '"' {
-				if i+1 < n && sql[i+1] == '"' {
+			if c == quotedIdentifierDelimiter {
+				if i+1 < n && sql[i+1] == quotedIdentifierDelimiter {
 					// escaped - skip escape
 					i++
 				} else {
@@ -576,16 +634,11 @@ func (l *lexer) run() error {
 				// marker mismatch
 				break
 			}
-			// marker found - rewrite to a plain quoted literal, exactly as
-			// upstream does
-			fullMarkerLen := len(dollarQuoteMarker) + 2
-			quoted := sql[lastPos : start+len(dollarQuoteMarker)+1]
-			content := quoted[fullMarkerLen : len(quoted)-fullMarkerLen]
-			content = strings.ReplaceAll(content, "'", "''")
-			quoted = "'" + content + "'"
-			// upstream records the rewritten text's length, not the source
-			// extent, so the span is Start + len(Text)
-			l.push(token.String, quoted, dollarMarkerStart-1)
+			// marker found - the token keeps its raw dollar-quoted text;
+			// the string literal matcher strips the delimiters
+			if err := l.pushRange(lastPos, end+1, token.String, false); err != nil {
+				return err
+			}
 			dollarQuoteMarker = ""
 			state = stateStandard
 			i = end
@@ -594,8 +647,12 @@ func (l *lexer) run() error {
 	}
 
 	switch state {
-	case stateSingleLineComment, stateMultiLineComment:
+	case stateSingleLineComment:
 		return l.pushRange(lastPos, n, token.Comment, false)
+	case stateMultiLineComment:
+		return l.pushRange(lastPos, n, token.Comment, true)
+	case stateOperator:
+		return l.pushOperator(lastPos, n)
 	case stateDollarQuotedString:
 		return l.pushRange(lastPos, n, token.String, true)
 	}
@@ -615,5 +672,13 @@ func (l *lexer) run() error {
 	if state == stateKeyword && !token.IsKeyword(lastWord) {
 		state = stateStandard
 	}
-	return l.pushRange(lastPos, n, stateToKind(state), isUnterminatedState(state))
+	// TokenizerBehavior::OnLastToken appends the token directly, bypassing
+	// PushToken and its preceding-trivia flags
+	l.tokens = append(l.tokens, token.Token{
+		Kind:         stateToKind(state),
+		Text:         lastWord,
+		Span:         token.Span{Start: lastPos, End: n},
+		Unterminated: isUnterminatedState(state),
+	})
+	return nil
 }

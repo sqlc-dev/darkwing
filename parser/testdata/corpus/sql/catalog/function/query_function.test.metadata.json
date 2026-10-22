@@ -1,11 +1,13 @@
 {
   "skip": {
     "5f81be9e9bc42318": "nested parse at bind time: the inner SQL string is parsed by a function, the grammar never sees it",
+    "b239297cf4a74a7c": "nested parse at bind time: the inner SQL string is parsed by a function, the grammar never sees it",
     "f84558899aa09cea": "nested parse at bind time: the inner SQL string is parsed by a function, the grammar never sees it"
   },
   "todo": {
     "2dbe98fbfd26e976": "oracle's Parser Error comes from outside the parse pipeline (bind-time setting/function/constraint validation or nested SQL parsing); darkwing accepts by design - revisit with milestone 6 error-fidelity work",
     "6849cf25332caa00": "oracle's Parser Error comes from outside the parse pipeline (bind-time setting/function/constraint validation or nested SQL parsing); darkwing accepts by design - revisit with milestone 6 error-fidelity work",
+    "7549873c3611e82d": "oracle's Parser Error comes from outside the parse pipeline (bind-time setting/function/constraint validation or nested SQL parsing); darkwing accepts by design - revisit with milestone 6 error-fidelity work",
     "aa55a1e51d55e50f": "oracle's Parser Error comes from outside the parse pipeline (bind-time setting/function/constraint validation or nested SQL parsing); darkwing accepts by design - revisit with milestone 6 error-fidelity work",
     "b1a7071252780b40": "oracle's Parser Error comes from outside the parse pipeline (bind-time setting/function/constraint validation or nested SQL parsing); darkwing accepts by design - revisit with milestone 6 error-fidelity work",
     "c0ff2e8320e39445": "oracle's Parser Error comes from outside the parse pipeline (bind-time setting/function/constraint validation or nested SQL parsing); darkwing accepts by design - revisit with milestone 6 error-fidelity work",

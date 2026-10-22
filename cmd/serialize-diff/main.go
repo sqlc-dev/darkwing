@@ -243,11 +243,15 @@ func isSelectOnly(sql string) (ok bool) {
 func oracleSerialize(bin string, sqls []string) ([]string, error) {
 	var script bytes.Buffer
 	script.WriteString(".mode line\n")
+	// the library grammar, not the CLI's shell extension (see
+	// duckdbsrc's oracle preamble)
+	script.WriteString("SET active_grammar_extensions=[];\n")
 	for _, sql := range sqls {
 		escaped := strings.ReplaceAll(sql, "'", "''")
 		fmt.Fprintf(&script, "SELECT json_serialize_sql('%s') AS j;\n", escaped)
 	}
 	cmd := exec.Command(bin, "-batch", "-noheader", "-list", ":memory:")
+	cmd.Env = duckdbsrc.Env()
 	cmd.Stdin = &script
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout

@@ -25,8 +25,9 @@ DARKWING_DUCKDB=/path/to/duckdb-cli go run ./cmd/serialize-diff -corpus
 The pinned binary is the one recorded in `internal/grammar/README.md`;
 goldens, grammar and corpus expectations must come from the same pin.
 
-At the time of writing (milestone 4) the full sweep covers 25,974
-SELECT-subset statements: 25,846 match, 0 mismatch, 128 skipped
+At the v2.0.0 pin (milestone 7) the full sweep covers 31,618
+SELECT-subset statements: 31,515 match, 0 mismatch, 103 skipped
 (statements the pinned binary itself refuses to serialize, e.g.
 PIVOT-with-enum-discovery forms that upstream turns into multi-statement
-plans, or literals it prints as bare Infinity tokens).
+plans, or literals it prints as bare Infinity tokens). The goldens hold
+2,626 of the matching statements (every 12th).
